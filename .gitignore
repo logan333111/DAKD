@@ -152,3 +152,58 @@ configs/local/default.yaml
 
 # Aim logging
 .aim
+
+############################################
+# ML / DL projects (VL2Lite / Lightning / Hydra)
+############################################
+
+# PyTorch / Lightning checkpoints & artifacts
+checkpoints/
+**/checkpoints/
+*.ckpt
+*.pth
+*.pt
+*.safetensors
+*.onnx
+
+# HuggingFace / Transformers cache (常见大头)
+**/.cache/huggingface/
+**/.cache/torch/
+**/.cache/torch_extensions/
+.cache/huggingface/
+.cache/torch/
+.cache/torch_extensions/
+
+# OpenCLIP / OpenAI CLIP / pretrained weights (常见 bin)
+*.bin
+
+# Weights & Biases / TensorBoard / other loggers
+wandb/
+**/wandb/
+tb_logs/
+**/tb_logs/
+lightning_logs/
+**/lightning_logs/
+events.out.tfevents.*
+**/events.out.tfevents.*
+
+# Hydra / Lightning 输出目录（你项目经常会有）
+outputs/
+**/outputs/
+multirun/
+**/multirun/
+
+# Common dataset folders (按你实际情况可删减)
+datasets/
+**/datasets/
+data_raw/
+**/data_raw/
+kd_datasets/
+**/kd_datasets/
+
+# OS / temp
+.DS_Store
+Thumbs.db
+*.tmp
+*.swp
+*.swo

@@ -18,7 +18,7 @@ net:
   #Must set use_teacher as True to use teacher 
   teacher: 
     arch: convnext_xxlarge
-    pretrained: laion2b_s34b_b82k_augreg_soup
+    pretrained: src/models/teacher/open_clip_pytorch_model.bin
   data_attributes: ${data.train_dataset.attributes}
   
   

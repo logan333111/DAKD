@@ -2,4 +2,5 @@ defaults:
   - default
 
 accelerator: gpu
-devices: 1
+devices: 4
+max_epochs: 300
