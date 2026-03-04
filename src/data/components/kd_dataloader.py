@@ -122,25 +122,46 @@ class GTSRBTestDataset(Dataset):
 
 class CUB200Dataset(Dataset):
     def __init__(self, root_dir, split="train", transform=None):
-
         assert split in ["train", "test"], "split should be either 'train' or 'test'"
         
         self.root_dir = root_dir
         self.image_paths = []
         self.labels = []
+        self.domains = []  # [DDK 新增] 用于存储每张图的 Domain ID
         self.split = split
         
+        # [DDK 新增] 1. 预先加载 Domain 映射表 (image_id -> domain_id)
+        # 假设该文件位于 root_dir 下 (即 data/kd_datasets/0_CUB_200_2011/ddk_image_domain_labels.txt)
+        domain_map = {}
+        domain_file_path = os.path.join(root_dir, 'ddk_image_domain_labels.txt')
+        
+        if os.path.exists(domain_file_path):
+            with open(domain_file_path, 'r') as f:
+                for line in f:
+                    img_id, dom_id = line.strip().split()
+                    domain_map[int(img_id)] = int(dom_id)
+        else:
+            print(f"[Warning] DDK domain file not found at {domain_file_path}. Defaulting domains to 0.")
+
+        # 加载 train/test split
         splits = []
         with open(os.path.join(root_dir, 'train_test_split.txt'), 'r') as f:
             for line in f:
                 _, is_train = line.strip().split(' ')
                 splits.append(int(is_train))
         
+        # 加载图片路径，同时匹配 Domain ID
         with open(os.path.join(root_dir, 'images.txt'), 'r') as f:
             for idx, line in enumerate(f):
                 img_id, img_path = line.strip().split(' ')
+                # 根据 split 筛选
                 if (split == "train" and splits[idx] == 1) or (split == "test" and splits[idx] == 0):
                     self.image_paths.append(os.path.join(root_dir, 'images', img_path))
+                    
+                    # [DDK 新增] 2. 获取当前图片的 Domain ID
+                    # 如果是测试集或者没找到文件，默认给 0 (测试集不需要 domain 但保持格式统一)
+                    d_id = domain_map.get(int(img_id), 0)
+                    self.domains.append(d_id)
                 
         with open(os.path.join(root_dir, 'image_class_labels.txt'), 'r') as f:
             for idx, line in enumerate(f):
@@ -155,14 +176,19 @@ class CUB200Dataset(Dataset):
 
     def __getitem__(self, idx):
         img_path = self.image_paths[idx]
+        # 注意：有些环境可能需要 .convert('RGB') 来处理灰度图
         image = Image.open(img_path).convert('RGB')
         
-        label = self.labels[idx] - 1 # label은 0부터 시작
+        label = self.labels[idx] - 1 # label 从 0 开始
+        
+        # [DDK 新增] 3. 获取 Domain ID
+        domain_id = self.domains[idx]
         
         if self.transform:
             image = self.transform(image)
         
-        return image, label
+        # [DDK 修改] 返回值增加 domain_id
+        return image, label, domain_id
 
 
 class DTDDataset(Dataset):

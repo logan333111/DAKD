@@ -3,7 +3,7 @@ optimizer:
   _target_: torch.optim.AdamW
   _partial_: true
   lr: 0.0001
-  weight_decay: 0.0
+  weight_decay: 0.05  # <--- 从 0.0 改为 0.05，强力抑制过拟合
 
 scheduler:
   _target_: torch.optim.lr_scheduler.StepLR
@@ -13,6 +13,14 @@ scheduler:
 
 use_teacher: true
 
+# ==========================================
+# [DDK 新增配置区域]
+# ==========================================
+ddk_enabled: true    # DDK 总开关，设为 false 即可退回你的 Baseline
+num_domains: 10      # 域的数量，必须与你跑脚本时设置的数量一致
+ddk_alpha: 0.5       # DDK 论文中的平滑更新系数，保持 0.5 最稳
+# ==========================================
+
 net:
   _target_: src.models.components.campus.TeacherStudent
   #Must set use_teacher as True to use teacher 
@@ -20,7 +28,6 @@ net:
     arch: convnext_xxlarge
     pretrained: src/models/teacher/open_clip_pytorch_model.bin
   data_attributes: ${data.train_dataset.attributes}
-  
   
   student:
     arch: resnet18
@@ -35,8 +42,8 @@ kd_criterion:
   nlp_criterion: 
     _target_: torch.nn.KLDivLoss
   temperature: 2.0
+  reduction: batchmean
   class_num: ${data.train_dataset.attributes.class_num}
-
 
 # compile model for faster training with pytorch 2.0
 compile: false

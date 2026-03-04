@@ -6,7 +6,7 @@ defaults:
   - data: kd_data
   - model: kda
   - callbacks: default
-  - logger: wandb # set logger here or use command line (e.g. `python train.py logger=tensorboard`)
+  - logger: tensorboard # set logger here or use command line (e.g. `python train.py logger=tensorboard`)
   - trainer: ddp
   - paths: default
   - extras: default
