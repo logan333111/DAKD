@@ -5,6 +5,7 @@ from lightning import LightningModule
 from torchmetrics import MaxMetric, MeanMetric
 from torchmetrics.classification.accuracy import Accuracy
 import numpy as np
+
 class KDModule(LightningModule):
     def __init__(
         self,
@@ -17,7 +18,7 @@ class KDModule(LightningModule):
         # [DDK 新增] 接收 DDK 配置参数
         ddk_enabled: bool = True,
         num_domains: int = 10,
-        ddk_alpha: float = 0.8,
+        ddk_alpha: float = 0.5,
     ) -> None:
         super().__init__()
 
@@ -30,7 +31,8 @@ class KDModule(LightningModule):
             self.kd_criterion = kd_criterion
         
         # 基础分类损失
-        self.criterion = torch.nn.CrossEntropyLoss(reduction='none') # [DDK 重要] 改为 none，以便给每个样本单独加权
+        # 加入 label_smoothing=0.1，极大地缓解模型在训练后期的盲目自信和过拟合
+        self.criterion = torch.nn.CrossEntropyLoss(reduction='none', label_smoothing=0.1)
 
         # [DDK 新增] 初始化 DDK 核心组件
         self.ddk_enabled = ddk_enabled
@@ -39,7 +41,6 @@ class KDModule(LightningModule):
             self.register_buffer('domain_weights', torch.ones(num_domains))
             
             # 2. 【终极防卡死方案】：用 EMA(指数移动平均) 状态替代 Accumulator
-            # 不再记录总和，而是实时记录移动平均 Loss
             self.register_buffer('domain_loss_ema', torch.zeros(num_domains))
 
         # --- 以下是原有的指标定义 (保持不变) ---
@@ -57,6 +58,9 @@ class KDModule(LightningModule):
             self.img_loss = MeanMetric()
 
         self.val_acc_best = MaxMetric()
+        
+        # [计划 B 新增] 用于暂存 test 阶段的预测数据，用于生成领域报告
+        self.test_step_outputs = []
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
@@ -66,7 +70,6 @@ class KDModule(LightningModule):
         self.val_acc.reset()
         self.val_acc_best.reset()
 
-   
     # [DDK 修改] model_step 接收的数据变了，多了一个 domain_ids
     def model_step(
         self, batch: Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
@@ -75,7 +78,7 @@ class KDModule(LightningModule):
             weight1 = current_epoch / (total_epochs * 8)
             weight1 = np.clip(weight1, 0, 1)
             weight2 = 1 - weight1
-            # 【防过拟合策略】：限制蒸馏 Loss 的最低权重为 0.2，避免后期大模型特征被完全遗忘
+            # 【防过拟合策略】：限制蒸馏 Loss 的最低权重为 0.2
             weight2 = np.clip(weight2, 0.2, 1)
             return weight1, weight2
 
@@ -102,26 +105,18 @@ class KDModule(LightningModule):
                         for d in range(self.hparams.num_domains):
                             mask = (domain_ids == d)
                             if mask.sum() > 0:
-                                # 求当前 Batch 该域的平均 Loss
                                 curr_loss = cls_loss_vec[mask].mean()
                                 
-                                # EMA 实时平滑更新难度
                                 if self.domain_loss_ema[d] == 0:
                                     self.domain_loss_ema[d] = curr_loss
                                 else:
-                                    # 0.9 是平滑系数，相当于参考过去 10 个 batch 的平均难度
                                     self.domain_loss_ema[d] = 0.9 * self.domain_loss_ema[d] + 0.1 * curr_loss
                         
-                        # 【DDK 退火策略】：让温度随进度上升
-                        # current_epoch 为 0 时，温度是 2.0 (DDK 敏锐捕捉难点)
-                        # current_epoch 接近 max_epochs 时，温度升到 12.0 (DDK 趋于平滑，所有域权重回归 1.0)
+                        # 【恢复稳健的 DDK 退火策略】
                         progress = self.current_epoch / self.trainer.max_epochs
                         dynamic_temperature = 2.0 + 10.0 * progress 
                         
-                        # 使用动态温度计算新权重
                         new_weights = F.softmax(self.domain_loss_ema / dynamic_temperature, dim=0) * self.hparams.num_domains
-                        
-                        # 每走一步就微调一次权重 (0.9保留旧权重，0.1更新新权重，保证训练稳定)
                         self.domain_weights.copy_(0.9 * self.domain_weights + 0.1 * new_weights)
             else:
                 weighted_cls_loss = cls_loss_vec.mean()
@@ -157,7 +152,7 @@ class KDModule(LightningModule):
                                 else:
                                     self.domain_loss_ema[d] = 0.9 * self.domain_loss_ema[d] + 0.1 * curr_loss
                         
-                        # 【DDK 退火策略】
+                        # 【恢复稳健的 DDK 退火策略】
                         progress = self.current_epoch / self.trainer.max_epochs
                         dynamic_temperature = 2.0 + 10.0 * progress 
                         
@@ -189,7 +184,6 @@ class KDModule(LightningModule):
         
         return loss
 
-    # [DDK 核心] 每个 Epoch 结束时更新权重
     # [DDK 核心] 仅保留日志打印，彻底消灭通信死锁
     def on_train_epoch_end(self) -> None:
         if self.ddk_enabled and self.trainer.is_global_zero:
@@ -198,7 +192,6 @@ class KDModule(LightningModule):
             print(f"\n[DDK Epoch {self.current_epoch}] Real-time Top Domain Weights: {top_weights}")
 
     def validation_step(self, batch, batch_idx):
-        # 验证集不需要 DDK 加权，但 batch 里会有 domain_id，model_step 会处理它
         loss, loss_dicts, preds, targets = self.model_step(batch)
         self.val_loss(loss)
         self.val_acc(preds, targets)
@@ -210,13 +203,60 @@ class KDModule(LightningModule):
         self.val_acc_best(acc)
         self.log("val/acc_best", self.val_acc_best.compute(), sync_dist=True, prog_bar=True)
 
+    # [计划 B 新增] 获取预测结果并存入列表
     def test_step(self, batch, batch_idx):
         loss, loss_dicts, preds, targets = self.model_step(batch)
+        
+        # 解包拿到 domain_ids
+        x, y, domain_ids = batch
+        
         self.test_loss(loss)
         self.test_acc(preds, targets)
         self.log("test/loss", self.test_loss, on_step=False, on_epoch=True, prog_bar=True)
         self.log("test/acc", self.test_acc, on_step=False, on_epoch=True, prog_bar=True)
-    
+        
+        # 将结果转到 CPU 并暂存
+        self.test_step_outputs.append({
+            "preds": preds.detach().cpu(),
+            "targets": targets.detach().cpu(),
+            "domain_ids": domain_ids.detach().cpu()
+        })
+
+    # [计划 B 新增] 在测试结束时汇总并打印每个 Domain 的准确率
+    def on_test_epoch_end(self) -> None:
+        if not self.test_step_outputs:
+            return
+            
+        # 如果是多卡测试，只在主卡上打印报告，防止重复刷屏
+        if self.trainer.is_global_zero:
+            # 由于可能有多张卡，我们这里简单汇总当前卡收集到的数据。
+            # （为了绝对精确的全局统计，通常需 all_gather，但对于看趋势这已经足够精准了）
+            all_preds = torch.cat([x["preds"] for x in self.test_step_outputs])
+            all_targets = torch.cat([x["targets"] for x in self.test_step_outputs])
+            all_domain_ids = torch.cat([x["domain_ids"] for x in self.test_step_outputs])
+
+            print(f"\n{'='*55}")
+            print(f"📊 [Test Report] 细粒度域准确率分析 (Per-Domain Accuracy)")
+            print(f"{'='*55}")
+
+            for d in range(self.hparams.num_domains):
+                mask = (all_domain_ids == d)
+                total_samples = mask.sum().item()
+                
+                if total_samples > 0:
+                    domain_preds = all_preds[mask]
+                    domain_targets = all_targets[mask]
+                    
+                    correct = (domain_preds == domain_targets).sum().item()
+                    acc = correct / total_samples
+                    
+                    print(f"Domain {d:02d} | 准确率: {acc*100:6.2f}% | 测试样本数: {total_samples}")
+
+            print(f"{'='*55}\n")
+            
+        # 清理内存
+        self.test_step_outputs.clear()
+
     # ... (setup 和 configure_optimizers 保持不变) ...
     def setup(self, stage: str) -> None:
         if self.hparams.compile and stage == "fit":

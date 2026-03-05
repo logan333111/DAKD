@@ -37,28 +37,29 @@ class KDDataset(Dataset):
         self.attributes = attributes #prompt_tmpl, class_num, classes
 
     def get_transform(self, split):
+        # 注意：这里原作者使用的是 CLIP/VLM 特有的 Normalize 参数，非常关键，我们保持绝对不变！
         normalize = transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
             std=[0.26862954, 0.26130258, 0.27577711])       
+            
         if split == 'train':
             return transforms.Compose([
                 transforms.Resize((256, 256)),
-                #transforms.Pad(10),
-                #transforms.Pad(20),
                 transforms.RandomCrop((224, 224)),
-                #transforms.CenterCrop((224, 224)),
-                RandomCropAndResize(min_crop_size=192, max_crop_size=224, final_size=224),
-                transforms.RandomRotation(60, interpolation = PIL.Image.BILINEAR),
-                transforms.GaussianBlur(kernel_size=(5, 5), sigma=(0.00001, 10)),
-                transforms.ColorJitter(brightness=.3, contrast=.1, saturation=.1, hue=.1),
                 transforms.RandomHorizontalFlip(),
+                
+                # 【核心替换】：用一句话的 RandAugment，替代原代码里那一大堆手动写的增强！
+                # num_ops=2 表示每次随机选 2 种操作，magnitude=9 表示中等偏上的增强强度
+                transforms.RandAugment(num_ops=2, magnitude=4),
+                
                 transforms.ToTensor(),
                 normalize,
-                #transforms.RandomErasing(p=0.5, scale=(0.3, 0.5), ratio=(0.3, 3.3),),
+                # 原作者注释掉的 RandomErasing (随机擦除) 其实防过拟合也很好，
+                # 如果加上 RandAugment 还是过拟合，你可以把下面这行取消注释
+                # transforms.RandomErasing(p=0.5, scale=(0.02, 0.33), ratio=(0.3, 3.3)),
                 ])
         else:
             return transforms.Compose([
-                        # transforms.Scale(256),
-                        # transforms.CenterCrop(224),
+                        # 验证集保持干净，不做任何干扰
                         transforms.Resize((224, 224)),
                         transforms.ToTensor(),
                         normalize,
@@ -251,24 +252,36 @@ class DTDDataset(Dataset):
         
         return image, label
 
+
 class AircraftDataset(Dataset):
     def __init__(self, root_dir, split="train", transform=None):
-
         assert split in ["train", "test", "val"], "split should be 'train', 'test', or 'val'"
         
         self.root_dir = root_dir
         self.image_paths = []
         self.labels = []
+        self.domains = []  # [DDK 新增] 存储每张图片的 Domain ID
         self.split = split
         
-        # 레이블 매핑
+        # 标签映射
         label_map = {}
         with open(os.path.join(root_dir, 'data', 'variants.txt'), 'r') as f:
             for idx, line in enumerate(f):
                 class_name = line.strip()
                 label_map[class_name] = idx
 
-        # 분할 파일 읽기
+        # [DDK 新增] 预先加载 Domain 映射表 (读取我们刚生成的那个 txt)
+        domain_map = {}
+        domain_file_path = os.path.join(root_dir, 'data', 'ddk_image_domain_labels.txt')
+        if os.path.exists(domain_file_path):
+            with open(domain_file_path, 'r') as f:
+                for line in f:
+                    img_id, dom_id = line.strip().split()
+                    domain_map[img_id] = int(dom_id) # 这里的 img_id 是字符串格式，刚好和下面读取的一致
+        else:
+            print(f"[Warning] DDK domain file not found at {domain_file_path}. Defaulting to Domain 9 (Others).")
+
+        # 读取切分文件
         with open(os.path.join(root_dir, 'data', f'images_variant_{split}.txt'), 'r') as f:
             for line in f:
                 line_split = line.strip().split(' ')
@@ -281,6 +294,9 @@ class AircraftDataset(Dataset):
                 self.image_paths.append(os.path.join(root_dir, 'data', 'images', img_name + '.jpg'))
                 self.labels.append(label_map[class_name])
                 
+                # [DDK 新增] 获取当前图片的 Domain ID。如果在前9大制造商里没找到，默认归入 9 (长尾联盟)
+                self.domains.append(domain_map.get(img_name, 9))
+                
         self.transform = transform
 
     def __len__(self):
@@ -292,10 +308,14 @@ class AircraftDataset(Dataset):
         
         label = self.labels[idx]
         
+        # [DDK 新增] 提取 Domain ID
+        domain_id = self.domains[idx]
+        
         if self.transform:
             image = self.transform(image)
         
-        return image, label
+        # [DDK 修改] 返回三元组：图像，标签，领域ID
+        return image, label, domain_id
 
 class NABirdsDataset(Dataset):
     def __init__(self, root_dir, split="train", transform=None):
