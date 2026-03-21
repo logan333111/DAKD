@@ -1,5 +1,5 @@
 defaults:
-  - attributes: 1_FGVC_AIRCRAFT
+  - attributes: 0_CUB_200_2011
 
 data_name: ${data.attributes.name}
 _target_: src.data.kd_datamodule.KDDataModule
@@ -18,6 +18,7 @@ test_dataset:
   split: test
 
 
-batch_size: 512 # Needs to be divisible by the number of devices (e.g., if in a distributed setup)
+batch_size: 256 # Needs to be divisible by the number of devices (e.g., if in a distributed setup)
 num_workers: 16
 pin_memory: False
+

@@ -16,9 +16,10 @@ use_teacher: true
 # ==========================================
 # [DDK 新增配置区域]
 # ==========================================
-ddk_enabled: true    # DDK 总开关，设为 false 即可退回你的 Baseline
-num_domains: 10      # 域的数量，必须与你跑脚本时设置的数量一致
-ddk_alpha: 0.5       # DDK 论文中的平滑更新系数，保持 0.5 最稳
+ddk_enabled: false   # DDK 总开关，设为 false 即可退回你的 Baseline
+num_domains: 10       # 域的数量，必须与你跑脚本时设置的数量一致
+ddk_alpha: 0.5       # （已废弃）保留向后兼容
+tsd_alpha: 0.2       # [OPT-A] TSD 中 cls_loss vs kd_gap 的平衡系数（归一化后）
 # ==========================================
 
 net:

@@ -1,10 +1,11 @@
 from typing import Any, Dict, Tuple
 import torch
-import torch.nn.functional as F  # [DDK] 需要用到 softmax
+import torch.nn.functional as F
 from lightning import LightningModule
 from torchmetrics import MaxMetric, MeanMetric
 from torchmetrics.classification.accuracy import Accuracy
 import numpy as np
+
 
 class KDModule(LightningModule):
     def __init__(
@@ -15,35 +16,36 @@ class KDModule(LightningModule):
         use_teacher: bool,
         kd_criterion,
         compile: bool,
-        # [DDK 新增] 接收 DDK 配置参数
-        ddk_enabled: bool = True,
-        num_domains: int = 10,
-        ddk_alpha: float = 0.5,
+        ddk_enabled: bool = True,       # DDK 总开关
+        num_domains: int = 5,           # 域数量
+        ddk_alpha: float = 0.5,         # 保留向后兼容（已废弃）
+        tsd_alpha: float = 0.3,         # TSD 难度计算的平衡系数
     ) -> None:
         super().__init__()
-
-        # 保存超参
         self.save_hyperparameters(logger=False)
 
         self.net = net
         self.use_teacher = use_teacher
         if use_teacher:
             self.kd_criterion = kd_criterion
-        
-        # 基础分类损失
-        # 加入 label_smoothing=0.1，极大地缓解模型在训练后期的盲目自信和过拟合
-        self.criterion = torch.nn.CrossEntropyLoss(reduction='none', label_smoothing=0.1)
 
-        # [DDK 新增] 初始化 DDK 核心组件
         self.ddk_enabled = ddk_enabled
+        
+        # [核心隔离] 根据是否开启 DDK，初始化不同的标准损失函数
         if self.ddk_enabled:
-            # 1. 域权重 r
-            self.register_buffer('domain_weights', torch.ones(num_domains))
+            # DDK 需要逐样本 loss 以及可能的平滑
+            self.criterion = torch.nn.CrossEntropyLoss(reduction='none', label_smoothing=0.1)
             
-            # 2. 【终极防卡死方案】：用 EMA(指数移动平均) 状态替代 Accumulator
-            self.register_buffer('domain_loss_ema', torch.zeros(num_domains))
+            # DDK 专属缓存与累加器
+            self.register_buffer('domain_weights', torch.ones(num_domains))
+            self._local_cls_loss_sum = None
+            self._local_kd_gap_sum = None
+            self._local_sample_count = None
+        else:
+            # 严格对齐原论文基线
+            self.criterion = torch.nn.CrossEntropyLoss()
 
-        # --- 以下是原有的指标定义 (保持不变) ---
+        # 指标定义
         num_classes = self.hparams.net.data_attributes.class_num
         self.train_acc = Accuracy(task="multiclass", num_classes=num_classes)
         self.val_acc = Accuracy(task="multiclass", num_classes=num_classes)
@@ -58,8 +60,6 @@ class KDModule(LightningModule):
             self.img_loss = MeanMetric()
 
         self.val_acc_best = MaxMetric()
-        
-        # [计划 B 新增] 用于暂存 test 阶段的预测数据，用于生成领域报告
         self.test_step_outputs = []
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -70,107 +70,114 @@ class KDModule(LightningModule):
         self.val_acc.reset()
         self.val_acc_best.reset()
 
-    # [DDK 修改] model_step 接收的数据变了，多了一个 domain_ids
-    def model_step(
-        self, batch: Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
-    ):
+        if self.ddk_enabled:
+            n = self.hparams.num_domains
+            self._local_cls_loss_sum = torch.zeros(n, device=self.device)
+            self._local_kd_gap_sum = torch.zeros(n, device=self.device)
+            self._local_sample_count = torch.zeros(n, device=self.device)
+
+    def model_step(self, batch: Tuple):
+        """前向传播 + 损失计算"""
+        # [还原] 严格使用原论文的全局退火策略，保证控制变量绝对公平
         def calculate_loss_weights(current_epoch, total_epochs):
             weight1 = current_epoch / (total_epochs * 8)
             weight1 = np.clip(weight1, 0, 1)
             weight2 = 1 - weight1
-            # 【防过拟合策略】：限制蒸馏 Loss 的最低权重为 0.2
-            weight2 = np.clip(weight2, 0.2, 1)
+            weight2 = np.clip(weight2, 0, 1)
             return weight1, weight2
 
-        x, y, domain_ids = batch
+        # 动态解包，兼容基线 Dataset 可能只返回 (x, y) 的情况
+        x = batch[0]
+        y = batch[1]
+        domain_ids = batch[2] if len(batch) > 2 else None
+
         loss_dict = {}
-        
+        cls_loss_vec = None
+        per_sample_kd_gap = None
+
         if self.use_teacher:
             outputs = self.forward(x)
-            img_loss, kd_loss = self.kd_criterion(outputs) 
-            cls_loss_vec = self.criterion(outputs[1], y)
-            cls_loss_weight, kd_loss_weight = calculate_loss_weights(self.current_epoch, self.trainer.max_epochs)
+            img_loss, kd_loss = self.kd_criterion(outputs)
             
+            # 基础分类损失计算
             if self.ddk_enabled:
+                cls_loss_vec = self.criterion(outputs[1], y)
+                base_cls_loss = cls_loss_vec.mean()
+            else:
+                base_cls_loss = self.criterion(outputs[1], y)
+                
+            cls_loss_weight, kd_loss_weight = calculate_loss_weights(self.current_epoch, self.trainer.max_epochs)
+
+            if self.ddk_enabled:
+                # =======================================================
+                # DDK 专属逻辑区 (只有 ddk_enabled=True 时才执行，不浪费基线算力)
+                # =======================================================
+                hidden_features, out, clip_img_features, clip_nlp_features, aligned_img, aligned_nlp = outputs
+                with torch.no_grad():
+                    per_sample_img_gap = (hidden_features - aligned_img).abs().mean(dim=-1)
+                    temp, scale = self.kd_criterion.temperature, self.kd_criterion.logit_scale
+                    student_logits = scale * hidden_features @ aligned_nlp.T / temp
+                    teacher_logits = scale * clip_img_features @ clip_nlp_features.T / temp
+                    per_sample_kl = F.kl_div(
+                        F.log_softmax(student_logits, dim=1),
+                        F.softmax(teacher_logits, dim=1),
+                        reduction='none'
+                    ).sum(dim=1) * (temp ** 2)
+                    per_sample_kd_gap = per_sample_img_gap + per_sample_kl
+
+                # DAR 域权重加权
                 sample_weights = self.domain_weights[domain_ids]
                 weighted_cls_loss = (cls_loss_vec * sample_weights).mean()
-                
                 batch_avg_weight = sample_weights.mean()
                 weighted_img_loss = img_loss * batch_avg_weight
                 weighted_kd_loss = kd_loss * batch_avg_weight
                 
-                # 【终极防卡死：无通信实时更新】
-                if self.training:
-                    with torch.no_grad():
-                        for d in range(self.hparams.num_domains):
-                            mask = (domain_ids == d)
-                            if mask.sum() > 0:
-                                curr_loss = cls_loss_vec[mask].mean()
-                                
-                                if self.domain_loss_ema[d] == 0:
-                                    self.domain_loss_ema[d] = curr_loss
-                                else:
-                                    self.domain_loss_ema[d] = 0.9 * self.domain_loss_ema[d] + 0.1 * curr_loss
-                        
-                        # 【恢复稳健的 DDK 退火策略】
-                        progress = self.current_epoch / self.trainer.max_epochs
-                        dynamic_temperature = 2.0 + 10.0 * progress 
-                        
-                        new_weights = F.softmax(self.domain_loss_ema / dynamic_temperature, dim=0) * self.hparams.num_domains
-                        self.domain_weights.copy_(0.9 * self.domain_weights + 0.1 * new_weights)
+                final_loss = cls_loss_weight * weighted_cls_loss + (kd_loss_weight * weighted_img_loss + kd_loss_weight * weighted_kd_loss) / 2
+                
             else:
-                weighted_cls_loss = cls_loss_vec.mean()
-                weighted_img_loss = img_loss
-                weighted_kd_loss = kd_loss
+                # =======================================================
+                # 严格的原版基线计算区
+                # =======================================================
+                cls_loss = cls_loss_weight * base_cls_loss
+                weighted_img_loss = kd_loss_weight * img_loss
+                weighted_kd_loss = kd_loss_weight * kd_loss
+                final_loss = cls_loss + (weighted_img_loss + weighted_kd_loss) / 2
 
-            final_loss = cls_loss_weight * weighted_cls_loss + \
-                         (kd_loss_weight * weighted_img_loss + kd_loss_weight * weighted_kd_loss) / 2
-            
             preds = torch.argmax(outputs[1], dim=1)
-            loss_dict["loss"] = final_loss
-            loss_dict["cls_loss"] = cls_loss_vec.mean()
-            loss_dict["img_loss"] = img_loss
-            loss_dict["kd_loss"] = kd_loss
+            loss_dict.update({
+                "loss": final_loss, 
+                "cls_loss": base_cls_loss, 
+                "img_loss": img_loss, 
+                "kd_loss": kd_loss
+            })
 
         else:
-            # 没有 Teacher 的情况
             logits = self.forward(x)
-            loss_vec = self.criterion(logits, y)
-            
             if self.ddk_enabled:
+                loss_vec = self.criterion(logits, y)
+                cls_loss_vec = loss_vec
                 sample_weights = self.domain_weights[domain_ids]
                 final_loss = (loss_vec * sample_weights).mean()
-                
-                if self.training:
-                    with torch.no_grad():
-                        for d in range(self.hparams.num_domains):
-                            mask = (domain_ids == d)
-                            if mask.sum() > 0:
-                                curr_loss = loss_vec[mask].mean()
-                                if self.domain_loss_ema[d] == 0:
-                                    self.domain_loss_ema[d] = curr_loss
-                                else:
-                                    self.domain_loss_ema[d] = 0.9 * self.domain_loss_ema[d] + 0.1 * curr_loss
-                        
-                        # 【恢复稳健的 DDK 退火策略】
-                        progress = self.current_epoch / self.trainer.max_epochs
-                        dynamic_temperature = 2.0 + 10.0 * progress 
-                        
-                        new_weights = F.softmax(self.domain_loss_ema / dynamic_temperature, dim=0) * self.hparams.num_domains
-                        self.domain_weights.copy_(0.9 * self.domain_weights + 0.1 * new_weights)
             else:
-                final_loss = loss_vec.mean()
-                
+                final_loss = self.criterion(logits, y)
+
             preds = torch.argmax(logits, dim=1)
             loss_dict["loss"] = final_loss
 
-        return final_loss, loss_dict, preds, y
+        return (
+            final_loss, loss_dict, preds, y,
+            cls_loss_vec.detach() if cls_loss_vec is not None else None,
+            per_sample_kd_gap.detach() if per_sample_kd_gap is not None else None,
+            domain_ids,
+        )
 
     def training_step(self, batch, batch_idx):
-        loss, loss_dicts, preds, targets = self.model_step(batch)
+        loss, loss_dicts, preds, targets, cls_loss_vec, per_sample_kd_gap, domain_ids = self.model_step(batch)
 
         self.train_loss(loss)
         self.train_acc(preds, targets)
+        
+        # 恢复使用原本的 self.log 以确保格式完全对齐
         self.log("train/loss", self.train_loss, on_step=False, on_epoch=True, prog_bar=True)
         self.log("train/acc", self.train_acc, on_step=False, on_epoch=True, prog_bar=True)
 
@@ -181,18 +188,104 @@ class KDModule(LightningModule):
             self.log("train/cls_loss", self.cls_loss, on_step=False, on_epoch=True, prog_bar=True)
             self.log("train/img_loss", self.img_loss, on_step=False, on_epoch=True, prog_bar=True)
             self.log("train/kd_loss", self.kd_loss, on_step=False, on_epoch=True, prog_bar=True)
-        
+
+        # DDK 独有的本地数据累加
+        if self.ddk_enabled and self.training:
+            with torch.no_grad():
+                for d in range(self.hparams.num_domains):
+                    mask = (domain_ids == d)
+                    count = mask.sum()
+                    if count > 0:
+                        self._local_cls_loss_sum[d] += cls_loss_vec[mask].sum()
+                        self._local_sample_count[d] += count
+                        if per_sample_kd_gap is not None:
+                            self._local_kd_gap_sum[d] += per_sample_kd_gap[mask].sum()
+
         return loss
 
-    # [DDK 核心] 仅保留日志打印，彻底消灭通信死锁
     def on_train_epoch_end(self) -> None:
-        if self.ddk_enabled and self.trainer.is_global_zero:
-            # 只在 GPU 0 上打印，看一眼当前实时权重即可
-            top_weights = self.domain_weights.topk(3).values.cpu().numpy().round(3)
-            print(f"\n[DDK Epoch {self.current_epoch}] Real-time Top Domain Weights: {top_weights}")
+        """基于本地统计数据的域难度评估与权重更新 (仅 DDK 开启时执行)"""
+        if not self.ddk_enabled or self._local_sample_count is None:
+            return
+
+        valid_mask = self._local_sample_count > 0
+        avg_cls_loss = torch.zeros_like(self._local_cls_loss_sum)
+        avg_kd_gap = torch.zeros_like(self._local_kd_gap_sum)
+
+        avg_cls_loss[valid_mask] = self._local_cls_loss_sum[valid_mask] / self._local_sample_count[valid_mask]
+        avg_kd_gap[valid_mask] = self._local_kd_gap_sum[valid_mask] / self._local_sample_count[valid_mask]
+
+        norm_cls, norm_kd = avg_cls_loss.clone(), avg_kd_gap.clone()
+        if valid_mask.sum() > 0:
+            cls_mean = avg_cls_loss[valid_mask].mean()
+            kd_mean = avg_kd_gap[valid_mask].mean()
+            if cls_mean > 0: norm_cls[valid_mask] /= cls_mean
+            if kd_mean > 0: norm_kd[valid_mask] /= kd_mean
+
+        import math
+
+        base_difficulty = self.hparams.tsd_alpha * norm_cls + (1 - self.hparams.tsd_alpha) * norm_kd
+        domain_difficulty = base_difficulty ** 2.0 
+
+        # ============================================================
+        # 🚀 自适应数据驱动退火 (完全基于 cls_loss 的真实进度)
+        # ============================================================
+        current_global_cls_loss = avg_cls_loss[valid_mask].mean().item()
+
+        # 1. 记录初始分类 Loss 作为基准点
+        if getattr(self, "initial_base_loss", None) is None or self.current_epoch == 0:
+            self.initial_base_loss = current_global_cls_loss
+
+        # 2. 计算纯分类 Loss 下降的比例
+        drop_ratio = (self.initial_base_loss - current_global_cls_loss) / (self.initial_base_loss + 1e-6)
+
+        # 3. 设定目标阈值：根据 TensorBoard 曲线，设定为 0.70 最稳妥
+        target_drop = 0.70 
+        
+        # 将其映射到 0~1 的进度条
+        progress = max(0.0, min(drop_ratio / target_drop, 1.0))
+
+        # 4. 余弦退火公式 
+        T_max = 3.0 
+        T_min = 0.2 
+        dynamic_temp = T_min + 0.5 * (T_max - T_min) * (1.0 + math.cos(math.pi * progress))
+        # ============================================================
+
+        new_weights = F.softmax(domain_difficulty / dynamic_temp, dim=0) * self.hparams.num_domains
+        
+        # ============================================================
+        # 🛡️ 优化防掉点机制：提高权重下限，防止简单域发生灾难性遗忘
+        # ============================================================
+        # 1. 把最低权重从 0.5 提高到 0.85，保证简单域有足够的复习算力
+        new_weights = torch.clamp(new_weights, min=0.65, max=1.45)
+        
+        perfect_domain_threshold = 0.05 
+        is_perfect_domain = (avg_cls_loss < perfect_domain_threshold) & valid_mask
+        if is_perfect_domain.any():
+            # 2. 弱化满分域惩罚：最多压到 0.75，而不是压死到 0.5
+            new_weights[is_perfect_domain] = torch.clamp(new_weights[is_perfect_domain], max=0.65)
+        # ============================================================
+        
+        self.domain_weights.copy_(0.8 * self.domain_weights + 0.2 * new_weights)
+
+        if hasattr(self.trainer, 'datamodule') and hasattr(self.trainer.datamodule, 'update_domain_weights'):
+            self.trainer.datamodule.update_domain_weights(self.domain_weights.cpu().clone())
+
+        if self.trainer.is_global_zero and self.current_epoch % 10 == 0:
+            print(f"\n📊 [TSD Epoch {self.current_epoch}] 域难度评估报告 (退火温度: {dynamic_temp:.3f}, 进度: {progress*100:.1f}%)")
+            print(f" {'域':^4} | {'难度':^8} | {'权重':^8} | {'分类损失':^8} | {'样本数':^6}")
+            for d in range(self.hparams.num_domains):
+                if self._local_sample_count[d] > 0:
+                    print(f" {d:02d}   | {domain_difficulty[d]:8.4f} | {self.domain_weights[d]:8.3f} "
+                          f"| {avg_cls_loss[d]:8.4f} | {int(self._local_sample_count[d]):6d}")
+            print()
+
+        self._local_cls_loss_sum.zero_()
+        self._local_kd_gap_sum.zero_()
+        self._local_sample_count.zero_()
 
     def validation_step(self, batch, batch_idx):
-        loss, loss_dicts, preds, targets = self.model_step(batch)
+        loss, _, preds, targets, _, _, _ = self.model_step(batch)
         self.val_loss(loss)
         self.val_acc(preds, targets)
         self.log("val/loss", self.val_loss, on_step=False, on_epoch=True, prog_bar=True)
@@ -203,61 +296,93 @@ class KDModule(LightningModule):
         self.val_acc_best(acc)
         self.log("val/acc_best", self.val_acc_best.compute(), sync_dist=True, prog_bar=True)
 
-    # [计划 B 新增] 获取预测结果并存入列表
     def test_step(self, batch, batch_idx):
-        loss, loss_dicts, preds, targets = self.model_step(batch)
-        
-        # 解包拿到 domain_ids
-        x, y, domain_ids = batch
-        
+        loss, _, preds, targets, cls_loss_vec, per_sample_kd_gap, domain_ids = self.model_step(batch)
         self.test_loss(loss)
         self.test_acc(preds, targets)
         self.log("test/loss", self.test_loss, on_step=False, on_epoch=True, prog_bar=True)
         self.log("test/acc", self.test_acc, on_step=False, on_epoch=True, prog_bar=True)
-        
-        # 将结果转到 CPU 并暂存
-        self.test_step_outputs.append({
-            "preds": preds.detach().cpu(),
-            "targets": targets.detach().cpu(),
-            "domain_ids": domain_ids.detach().cpu()
-        })
 
-    # [计划 B 新增] 在测试结束时汇总并打印每个 Domain 的准确率
+        # 【核心修改】：无视 ddk_enabled 开关，只要有 domain_ids，全收集！
+        output = {
+            "preds": preds,
+            "targets": targets,
+        }
+        if domain_ids is not None:
+            output["domain_ids"] = domain_ids
+            # Baseline 可能没有逐样本的 cls_loss_vec，给它填 0 防止维度对齐报错
+            output["cls_loss"] = cls_loss_vec if cls_loss_vec is not None else torch.zeros_like(preds, dtype=torch.float)
+                
+        self.test_step_outputs.append(output)
+
     def on_test_epoch_end(self) -> None:
         if not self.test_step_outputs:
             return
-            
-        # 如果是多卡测试，只在主卡上打印报告，防止重复刷屏
+
+        # 1. 局部拼接
+        local_preds = torch.cat([x["preds"] for x in self.test_step_outputs])
+        local_targets = torch.cat([x["targets"] for x in self.test_step_outputs])
+        has_domains = "domain_ids" in self.test_step_outputs[0]
+        
+        if has_domains:
+            local_domains = torch.cat([x["domain_ids"] for x in self.test_step_outputs])
+            local_cls_loss = torch.cat([x["cls_loss"] for x in self.test_step_outputs])
+
+        # 2. 全局多卡收集 (all_gather)
+        all_preds = self.all_gather(local_preds).view(-1)
+        all_targets = self.all_gather(local_targets).view(-1)
+        if has_domains:
+            all_domains = self.all_gather(local_domains).view(-1)
+            all_cls_loss = self.all_gather(local_cls_loss).view(-1)
+
+        # 3. 主进程打印与保存
         if self.trainer.is_global_zero:
-            # 由于可能有多张卡，我们这里简单汇总当前卡收集到的数据。
-            # （为了绝对精确的全局统计，通常需 all_gather，但对于看趋势这已经足够精准了）
-            all_preds = torch.cat([x["preds"] for x in self.test_step_outputs])
-            all_targets = torch.cat([x["targets"] for x in self.test_step_outputs])
-            all_domain_ids = torch.cat([x["domain_ids"] for x in self.test_step_outputs])
-
-            print(f"\n{'='*55}")
-            print(f"📊 [Test Report] 细粒度域准确率分析 (Per-Domain Accuracy)")
-            print(f"{'='*55}")
-
-            for d in range(self.hparams.num_domains):
-                mask = (all_domain_ids == d)
-                total_samples = mask.sum().item()
-                
-                if total_samples > 0:
-                    domain_preds = all_preds[mask]
-                    domain_targets = all_targets[mask]
-                    
-                    correct = (domain_preds == domain_targets).sum().item()
-                    acc = correct / total_samples
-                    
-                    print(f"Domain {d:02d} | 准确率: {acc*100:6.2f}% | 测试样本数: {total_samples}")
-
-            print(f"{'='*55}\n")
+            all_preds = all_preds.cpu()
+            all_targets = all_targets.cpu()
             
-        # 清理内存
+            import json
+            class_metrics = {}
+            num_classes = self.hparams.net.data_attributes.class_num
+            
+            for c in range(num_classes):
+                mask = (all_targets == c)
+                if mask.sum() > 0:
+                    acc = (all_preds[mask] == all_targets[mask]).sum().item() / mask.sum().item()
+                    class_metrics[int(c)] = {"acc": float(acc)}
+                else:
+                    class_metrics[int(c)] = {"acc": 0.0}
+            
+            save_path = "baseline_class_metrics.json"
+            with open(save_path, "w") as f:
+                json.dump(class_metrics, f, indent=4)
+            print(f"\n✅ [DDK 预处理] 错题本已成功生成并保存至: {save_path}")
+
+            # =======================================================
+            # 【核心修改】：无视 ddk_enabled 限制，只要有域信息就强制打印报告！
+            # =======================================================
+            if has_domains:
+                all_domains = all_domains.cpu()
+                all_cls_loss = all_cls_loss.cpu()
+                
+                print(f"\n📊 [Baseline vs DDK 对比评估] 细粒度域评估报告")
+                print(f" {'域':^4} | {'准确率':^8} | {'分类损失':^8} | {'样本数':^6}")
+                
+                domain_stats = []
+                # 注意：你之前设置的是 num_domains=10，这里会完整打印有数据的域
+                for d in range(self.hparams.num_domains):
+                    mask = (all_domains == d)
+                    total = mask.sum().item()
+                    if total > 0:
+                        acc = (all_preds[mask] == all_targets[mask]).sum().item() / total
+                        avg_cls = all_cls_loss[mask].mean().item()
+                        print(f" {d:02d}   | {acc*100:6.2f}% | {avg_cls:8.4f} | {total:6d}")
+                        domain_stats.append(acc)
+
+                if domain_stats:
+                    print(f"\n 📈 汇总 -> 平均准确率: {np.mean(domain_stats)*100:.2f}%, 准确率标准差: {np.std(domain_stats)*100:.2f}%\n")
+            
         self.test_step_outputs.clear()
 
-    # ... (setup 和 configure_optimizers 保持不变) ...
     def setup(self, stage: str) -> None:
         if self.hparams.compile and stage == "fit":
             self.net = torch.compile(self.net)
@@ -278,5 +403,4 @@ class KDModule(LightningModule):
         return {"optimizer": optimizer}
 
 if __name__ == "__main__":
-    # 测试代码
     pass

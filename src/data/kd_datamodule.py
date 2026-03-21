@@ -2,54 +2,17 @@ from typing import Any, Dict, Optional, Tuple
 
 import torch
 from lightning import LightningDataModule
-from torch.utils.data import ConcatDataset, DataLoader, Dataset, random_split
+from torch.utils.data import (
+    ConcatDataset,
+    DataLoader,
+    Dataset,
+    WeightedRandomSampler,
+    random_split,
+)
 from torchvision.datasets import MNIST
 from torchvision.transforms import transforms
 
 class KDDataModule(LightningDataModule):
-    """`LightningDataModule` for the MNIST dataset.
-
-    The MNIST database of handwritten digits has a training set of 60,000 examples, and a test set of 10,000 examples.
-    It is a subset of a larger set available from NIST. The digits have been size-normalized and centered in a
-    fixed-size image. The original black and white images from NIST were size normalized to fit in a 20x20 pixel box
-    while preserving their aspect ratio. The resulting images contain grey levels as a result of the anti-aliasing
-    technique used by the normalization algorithm. the images were centered in a 28x28 image by computing the center of
-    mass of the pixels, and translating the image so as to position this point at the center of the 28x28 field.
-
-    A `LightningDataModule` implements 7 key methods:
-
-    ```python
-        def prepare_data(self):
-        # Things to do on 1 GPU/TPU (not on every GPU/TPU in DDP).
-        # Download data, pre-process, split, save to disk, etc...
-
-        def setup(self, stage):
-        # Things to do on every process in DDP.
-        # Load data, set variables, etc...
-
-        def train_dataloader(self):
-        # return train dataloader
-
-        def val_dataloader(self):
-        # return validation dataloader
-
-        def test_dataloader(self):
-        # return test dataloader
-
-        def predict_dataloader(self):
-        # return predict dataloader
-
-        def teardown(self, stage):
-        # Called on every process in DDP.
-        # Clean up after fit or test.
-    ```
-
-    This allows you to share a full dataset without explaining how to download,
-    split, transform and process the data.
-
-    Read the docs:
-        https://lightning.ai/docs/pytorch/latest/data/datamodule.html
-    """
 
     def __init__(
         self,
@@ -61,14 +24,6 @@ class KDDataModule(LightningDataModule):
         num_workers: int = 0,
         pin_memory: bool = False,
     ) -> None:
-        """Initialize a `MNISTDataModule`.
-
-        :param data_dir: The data directory. Defaults to `"data/"`.
-        :param train_val_test_split: The train, validation and test split. Defaults to `(55_000, 5_000, 10_000)`.
-        :param batch_size: The batch size. Defaults to `64`.
-        :param num_workers: The number of workers. Defaults to `0`.
-        :param pin_memory: Whether to pin memory. Defaults to `False`.
-        """
         super().__init__()
 
         # this line allows to access init params with 'self.hparams' attribute
@@ -81,34 +36,21 @@ class KDDataModule(LightningDataModule):
 
         self.batch_size_per_device = batch_size
 
+        # ============================================================
+        # [DAR - Sampling Reweighting] 域采样权重
+        # 由 KDModule 在每个 epoch 结束后通过 update_domain_weights() 更新
+        # None 表示使用均匀随机采样（默认行为）
+        # ============================================================
+        self._domain_weights: Optional[torch.Tensor] = None
+
     @property
     def num_classes(self) -> int:
-        """Get the number of classes.
-
-        :return: The number of MNIST classes (10).
-        """
         return self.data_train.attributes.num_classes
 
     def prepare_data(self) -> None:
-        """Download data if needed. Lightning ensures that `self.prepare_data()` is called only
-        within a single process on CPU, so you can safely add your downloading logic within. In
-        case of multi-node training, the execution of this hook depends upon
-        `self.prepare_data_per_node()`.
-
-        Do not use it to assign state (self.x = y).
-        """
-
+        pass
 
     def setup(self, stage: Optional[str] = None) -> None:
-        """Load data. Set variables: `self.data_train`, `self.data_val`, `self.data_test`.
-
-        This method is called by Lightning before `trainer.fit()`, `trainer.validate()`, `trainer.test()`, and
-        `trainer.predict()`, so be careful not to execute things like random split twice! Also, it is called after
-        `self.prepare_data()` and there is a barrier in between which ensures that all the processes proceed to
-        `self.setup()` once the data is prepared and available for use.
-
-        :param stage: The stage to setup. Either `"fit"`, `"validate"`, `"test"`, or `"predict"`. Defaults to ``None``.
-        """
         # Divide batch size by the number of devices.
         if self.trainer is not None:
             if self.hparams.batch_size % self.trainer.world_size != 0:
@@ -117,26 +59,55 @@ class KDDataModule(LightningDataModule):
                 )
             self.batch_size_per_device = self.hparams.batch_size // self.trainer.world_size
 
+    def update_domain_weights(self, weights: torch.Tensor) -> None:
+        """
+        [DAR] 更新域采样权重。
+        由 KDModule.on_train_epoch_end() 在每个 epoch 结束后调用。
 
+        参数:
+            weights: 域权重张量，形状为 (num_domains,)，
+                     较大的值表示该域更难、需要更多采样
+        """
+        self._domain_weights = weights
 
     def train_dataloader(self) -> DataLoader[Any]:
-        """Create and return the train dataloader.
-
-        :return: The train dataloader.
         """
+        创建训练 DataLoader。
+
+        [DAR - Sampling Reweighting 路径]
+        当域权重可用且数据集支持 domain_id 时，使用 WeightedRandomSampler
+        让难域的样本在每个 epoch 中被采样更多次。
+        否则退回标准的均匀随机 shuffle。
+        """
+        sampler = None
+        shuffle = True
+
+        # [DAR] 如果有域权重且数据集提供了域信息，启用加权采样
+        # ⚠️ 注意: 为防止“双重惩罚”(Double Reweighting)，我们在 Loss 层保留了域权重，
+        # 在采样层暂时关闭加权随机采样。保证模型能均匀地看到所有的简单样本，
+        # 同时利用 Loss Reweighting 在困难样本上拉大梯度。
+        # if self._domain_weights is not None and hasattr(self.data_train, 'domains'):
+        #     domains = torch.tensor(self.data_train.domains, dtype=torch.long)
+        #     # 每个样本的采样权重 = 其所属域的权重
+        #     sample_weights = self._domain_weights[domains].double()
+        #     sampler = WeightedRandomSampler(
+        #         weights=sample_weights,
+        #         num_samples=len(self.data_train),  # 保持每个 epoch 的总样本数不变
+        #         replacement=True,  # 允许重复采样（难域样本可能被采多次）
+        #     )
+        #     shuffle = False  # WeightedRandomSampler 与 shuffle 互斥
+
         return DataLoader(
             dataset=self.data_train,
             batch_size=self.batch_size_per_device,
             num_workers=self.hparams.num_workers,
             pin_memory=self.hparams.pin_memory,
-            shuffle=True,
+            shuffle=shuffle,
+            sampler=sampler,
+            drop_last=True
         )
 
     def val_dataloader(self) -> DataLoader[Any]:
-        """Create and return the validation dataloader.
-
-        :return: The validation dataloader.
-        """
         return DataLoader(
             dataset=self.data_val,
             batch_size=self.batch_size_per_device,
@@ -146,10 +117,6 @@ class KDDataModule(LightningDataModule):
         )
 
     def test_dataloader(self) -> DataLoader[Any]:
-        """Create and return the test dataloader.
-
-        :return: The test dataloader.
-        """
         return DataLoader(
             dataset=self.data_test,
             batch_size=self.batch_size_per_device,
@@ -159,28 +126,20 @@ class KDDataModule(LightningDataModule):
         )
 
     def teardown(self, stage: Optional[str] = None) -> None:
-        """Lightning hook for cleaning up after `trainer.fit()`, `trainer.validate()`,
-        `trainer.test()`, and `trainer.predict()`.
-
-        :param stage: The stage being torn down. Either `"fit"`, `"validate"`, `"test"`, or `"predict"`.
-            Defaults to ``None``.
-        """
         pass
 
     def state_dict(self) -> Dict[Any, Any]:
-        """Called when saving a checkpoint. Implement to generate and save the datamodule state.
-
-        :return: A dictionary containing the datamodule state that you want to save.
-        """
-        return {}
+        """保存 DataModule 状态到 checkpoint。"""
+        state = {}
+        if self._domain_weights is not None:
+            state['domain_weights'] = self._domain_weights
+        return state
 
     def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
-        """Called when loading a checkpoint. Implement to reload datamodule state given datamodule
-        `state_dict()`.
-
-        :param state_dict: The datamodule state returned by `self.state_dict()`.
-        """
-        pass
+        """从 checkpoint 恢复 DataModule 状态。"""
+        if 'domain_weights' in state_dict:
+            self._domain_weights = state_dict['domain_weights']
+            print("[DAR] 已从 checkpoint 恢复域采样权重")
 
 
 if __name__ == "__main__":
