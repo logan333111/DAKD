@@ -123,6 +123,11 @@ class GTSRBTestDataset(Dataset):
         return image, label
 
 
+import os
+import random
+from PIL import Image
+from torch.utils.data import Dataset
+
 class CUB200Dataset(Dataset):
     def __init__(self, root_dir, split="train", transform=None):
         assert split in ["train", "test"], "split should be either 'train' or 'test'"
@@ -130,21 +135,7 @@ class CUB200Dataset(Dataset):
         self.root_dir = root_dir
         self.image_paths = []
         self.labels = []
-        self.domains = []  # [DDK 新增] 用于存储每张图的 Domain ID
         self.split = split
-        
-        # [DDK 新增] 1. 预先加载 Domain 映射表 (image_id -> domain_id)
-        # 假设该文件位于 root_dir 下 (即 data/kd_datasets/0_CUB_200_2011/ddk_image_domain_labels.txt)
-        domain_map = {}
-        domain_file_path = os.path.join(root_dir, 'ddk_image_domain_labels.txt')
-        
-        if os.path.exists(domain_file_path):
-            with open(domain_file_path, 'r') as f:
-                for line in f:
-                    img_id, dom_id = line.strip().split()
-                    domain_map[int(img_id)] = int(dom_id)
-        else:
-            print(f"[Warning] DDK domain file not found at {domain_file_path}. Defaulting domains to 0.")
 
         # 加载 train/test split
         splits = []
@@ -153,25 +144,36 @@ class CUB200Dataset(Dataset):
                 _, is_train = line.strip().split(' ')
                 splits.append(int(is_train))
         
-        # 加载图片路径，同时匹配 Domain ID
+        # 加载图片路径
         with open(os.path.join(root_dir, 'images.txt'), 'r') as f:
             for idx, line in enumerate(f):
                 img_id, img_path = line.strip().split(' ')
                 # 根据 split 筛选
                 if (split == "train" and splits[idx] == 1) or (split == "test" and splits[idx] == 0):
                     self.image_paths.append(os.path.join(root_dir, 'images', img_path))
-                    
-                    # [DDK 新增] 2. 获取当前图片的 Domain ID
-                    # 如果是测试集或者没找到文件，默认给 0 (测试集不需要 domain 但保持格式统一)
-                    d_id = domain_map.get(int(img_id), 0)
-                    self.domains.append(d_id)
                 
+        # 加载图片类别标签
         with open(os.path.join(root_dir, 'image_class_labels.txt'), 'r') as f:
             for idx, line in enumerate(f):
                 _, label = line.strip().split(' ')
                 if (split == "train" and splits[idx] == 1) or (split == "test" and splits[idx] == 0):
                     self.labels.append(int(label))
         
+        # =======================================================
+        # [DDK 新增] 预先加载基于类别的 Domain 映射表 (class_id -> domain_id)
+        # =======================================================
+        domain_json_path = os.path.join(root_dir, 'class_to_domain_10.json')
+        if os.path.exists(domain_json_path):
+            import json
+            with open(domain_json_path, 'r') as f:
+                self.class_domain_map = json.load(f)
+            # 仅在训练集打印一次，避免刷屏
+            if split == "train":
+                print(f"✅ [DDK] 成功加载 CUB200 类别难度分域表: {domain_json_path}")
+        else:
+            print(f"[Warning] 找不到 {domain_json_path}，所有鸟类品种默认分配到 Domain 0")
+            self.class_domain_map = {}
+
         self.transform = transform
 
     def __len__(self):
@@ -182,15 +184,19 @@ class CUB200Dataset(Dataset):
         # 注意：有些环境可能需要 .convert('RGB') 来处理灰度图
         image = Image.open(img_path).convert('RGB')
         
-        label = self.labels[idx] - 1 # label 从 0 开始
+        # CUB原始标签是从1开始的，这里转换为从0开始 (0~199)
+        label = self.labels[idx] - 1 
         
-        # [DDK 新增] 3. 获取 Domain ID
-        domain_id = self.domains[idx]
+        # =======================================================
+        # [DDK 新增] 直接根据真实的鸟类标签 (0~199) 获取 domain_id
+        # =======================================================
+        # 注意：假设 json 文件里的 key 是从 "0" 到 "199" 的字符串
+        domain_id = self.class_domain_map.get(str(label), 0)
         
         if self.transform:
             image = self.transform(image)
         
-        # [DDK 修改] 返回值增加 domain_id
+        # [DDK 修改] 返回三元组：图像，标签，领域ID
         return image, label, domain_id
 
 
@@ -872,6 +878,20 @@ class Caltech256Dataset(Dataset):
         self.image_paths = [self.image_paths[i] for i in split_indices]
         self.labels = [self.labels[i] for i in split_indices]
 
+        # =======================================================
+        # [DDK 新增] 预先加载基于类别的 Domain 映射表 (class_id -> domain_id)
+        # =======================================================
+        domain_json_path = os.path.join(root_dir, 'class_to_domain_10.json')
+        if os.path.exists(domain_json_path):
+            import json
+            with open(domain_json_path, 'r') as f:
+                self.class_domain_map = json.load(f)
+            if split == "train":
+                print(f"✅ [DDK] 成功加载 Caltech256 类别难度分域表: {domain_json_path}")
+        else:
+            print(f"[Warning] 找不到 {domain_json_path}，所有类别默认分配到 Domain 0")
+            self.class_domain_map = {}
+
     def __len__(self):
         return len(self.image_paths)
 
@@ -880,7 +900,13 @@ class Caltech256Dataset(Dataset):
         image = Image.open(img_path).convert('RGB')
         label = self.labels[idx]
         
+        # =======================================================
+        # [DDK 新增] 直接根据类别标签获取 domain_id
+        # =======================================================
+        domain_id = self.class_domain_map.get(str(label), 0)
+        
         if self.transform:
             image = self.transform(image)
         
-        return image, label
+        # [DDK 修改] 返回三元组：图像，标签，领域ID
+        return image, label, domain_id

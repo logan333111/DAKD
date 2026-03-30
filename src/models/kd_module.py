@@ -19,7 +19,7 @@ class KDModule(LightningModule):
         ddk_enabled: bool = True,       # DDK 总开关
         num_domains: int = 5,           # 域数量
         ddk_alpha: float = 0.5,         # 保留向后兼容（已废弃）
-        tsd_alpha: float = 0.3,         # TSD 难度计算的平衡系数
+        tsd_alpha: float = 0.2,         # TSD 难度计算的平衡系数
     ) -> None:
         super().__init__()
         self.save_hyperparameters(logger=False)
@@ -253,20 +253,22 @@ class KDModule(LightningModule):
 
         new_weights = F.softmax(domain_difficulty / dynamic_temp, dim=0) * self.hparams.num_domains
         
+       # ============================================================
+        # 🛡️ 优化防掉点机制：非对称动量平滑 (Asymmetric EMA)
         # ============================================================
-        # 🛡️ 优化防掉点机制：提高权重下限，防止简单域发生灾难性遗忘
-        # ============================================================
-        # 1. 把最低权重从 0.5 提高到 0.85，保证简单域有足够的复习算力
         new_weights = torch.clamp(new_weights, min=0.65, max=1.45)
         
-        perfect_domain_threshold = 0.05 
-        is_perfect_domain = (avg_cls_loss < perfect_domain_threshold) & valid_mask
-        if is_perfect_domain.any():
-            # 2. 弱化满分域惩罚：最多压到 0.75，而不是压死到 0.5
-            new_weights[is_perfect_domain] = torch.clamp(new_weights[is_perfect_domain], max=0.65)
-        # ============================================================
+        perfect_threshold = 0.05
+        is_perfect = (avg_cls_loss < perfect_threshold) & valid_mask
         
-        self.domain_weights.copy_(0.8 * self.domain_weights + 0.2 * new_weights)
+        # 动态生成平滑动量 beta
+        # 正常域 beta = 0.8，完美域 beta = 0.98 (极强惯性，抵御剧烈下降)
+        dynamic_beta = torch.full_like(self.domain_weights, 0.8)
+        dynamic_beta[is_perfect] = 0.98
+        
+        # 使用动态 beta 进行更新
+        self.domain_weights.copy_(dynamic_beta * self.domain_weights + (1 - dynamic_beta) * new_weights)
+        # ============================================================
 
         if hasattr(self.trainer, 'datamodule') and hasattr(self.trainer.datamodule, 'update_domain_weights'):
             self.trainer.datamodule.update_domain_weights(self.domain_weights.cpu().clone())

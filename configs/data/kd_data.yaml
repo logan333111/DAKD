@@ -1,5 +1,5 @@
 defaults:
-  - attributes: 0_CUB_200_2011
+  - attributes: 8_CALTECH256
 
 data_name: ${data.attributes.name}
 _target_: src.data.kd_datamodule.KDDataModule
