@@ -3,7 +3,7 @@ optimizer:
   _target_: torch.optim.AdamW
   _partial_: true
   lr: 0.0001
-  weight_decay: 0.05  # <--- 从 0.0 改为 0.05，强力抑制过拟合
+  weight_decay: 0.05
 
 scheduler:
   _target_: torch.optim.lr_scheduler.StepLR
@@ -13,29 +13,24 @@ scheduler:
 
 use_teacher: true
 
-# ==========================================
-# [DDK 新增配置区域]
-# ==========================================
-ddk_enabled: true   # DDK 总开关，设为 false 即可退回你的 Baseline
-num_domains: 10       # 域的数量，必须与你跑脚本时设置的数量一致
-ddk_alpha: 0.5       # （已废弃）保留向后兼容
-tsd_alpha: 0.2       # [OPT-A] TSD 中 cls_loss vs kd_gap 的平衡系数（归一化后）
-# ==========================================
+# D3KD settings (set ddk_enabled=false for baseline)
+ddk_enabled: true
+num_domains: 10
+tsd_alpha: 0.2  # Balance between cls_loss and kd_gap in TSD
 
 net:
   _target_: src.models.components.campus.TeacherStudent
-  #Must set use_teacher as True to use teacher 
   teacher: 
     arch: convnext_xxlarge
     pretrained: src/models/teacher/open_clip_pytorch_model.bin
   data_attributes: ${data.train_dataset.attributes}
   
   student:
-    arch: resnet18
+    arch: mobilenet_v2
+    pretrained: true
 
   use_teacher: ${model.use_teacher}
 
-#Must set use_teacher as True to use teacher 
 kd_criterion:
   _target_: src.models.components.criterion.KDCriterion
   img_criterion: 
@@ -46,5 +41,4 @@ kd_criterion:
   reduction: batchmean
   class_num: ${data.train_dataset.attributes.class_num}
 
-# compile model for faster training with pytorch 2.0
 compile: false

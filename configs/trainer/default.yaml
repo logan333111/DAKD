@@ -14,7 +14,7 @@ devices: 1
 # perform a validation loop every N training epochs
 check_val_every_n_epoch: 1
 
-# [DAR] 每个 epoch 重新创建 DataLoader，以应用更新后的域采样权重
+# Reload dataloaders every epoch to apply updated domain weights
 reload_dataloaders_every_n_epochs: 1
 
 # set True to to ensure deterministic results

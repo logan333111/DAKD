@@ -16,10 +16,9 @@ class KDModule(LightningModule):
         use_teacher: bool,
         kd_criterion,
         compile: bool,
-        ddk_enabled: bool = True,       # DDK 总开关
-        num_domains: int = 5,           # 域数量
-        ddk_alpha: float = 0.5,         # 保留向后兼容（已废弃）
-        tsd_alpha: float = 0.2,         # TSD 难度计算的平衡系数
+        ddk_enabled: bool = True,
+        num_domains: int = 10,
+        tsd_alpha: float = 0.2,  # Balance between cls_loss and kd_gap in TSD
     ) -> None:
         super().__init__()
         self.save_hyperparameters(logger=False)
@@ -31,21 +30,16 @@ class KDModule(LightningModule):
 
         self.ddk_enabled = ddk_enabled
         
-        # [核心隔离] 根据是否开启 DDK，初始化不同的标准损失函数
         if self.ddk_enabled:
-            # DDK 需要逐样本 loss 以及可能的平滑
+            # Per-sample loss for DDK reweighting
             self.criterion = torch.nn.CrossEntropyLoss(reduction='none', label_smoothing=0.1)
-            
-            # DDK 专属缓存与累加器
             self.register_buffer('domain_weights', torch.ones(num_domains))
             self._local_cls_loss_sum = None
             self._local_kd_gap_sum = None
             self._local_sample_count = None
         else:
-            # 严格对齐原论文基线
             self.criterion = torch.nn.CrossEntropyLoss()
 
-        # 指标定义
         num_classes = self.hparams.net.data_attributes.class_num
         self.train_acc = Accuracy(task="multiclass", num_classes=num_classes)
         self.val_acc = Accuracy(task="multiclass", num_classes=num_classes)
@@ -77,8 +71,8 @@ class KDModule(LightningModule):
             self._local_sample_count = torch.zeros(n, device=self.device)
 
     def model_step(self, batch: Tuple):
-        """前向传播 + 损失计算"""
-        # [还原] 严格使用原论文的全局退火策略，保证控制变量绝对公平
+        """Forward pass and loss computation."""
+        # Global annealing schedule from the original paper
         def calculate_loss_weights(current_epoch, total_epochs):
             weight1 = current_epoch / (total_epochs * 8)
             weight1 = np.clip(weight1, 0, 1)
@@ -86,7 +80,6 @@ class KDModule(LightningModule):
             weight2 = np.clip(weight2, 0, 1)
             return weight1, weight2
 
-        # 动态解包，兼容基线 Dataset 可能只返回 (x, y) 的情况
         x = batch[0]
         y = batch[1]
         domain_ids = batch[2] if len(batch) > 2 else None
@@ -94,12 +87,12 @@ class KDModule(LightningModule):
         loss_dict = {}
         cls_loss_vec = None
         per_sample_kd_gap = None
+        teacher_preds = None
 
         if self.use_teacher:
             outputs = self.forward(x)
             img_loss, kd_loss = self.kd_criterion(outputs)
             
-            # 基础分类损失计算
             if self.ddk_enabled:
                 cls_loss_vec = self.criterion(outputs[1], y)
                 base_cls_loss = cls_loss_vec.mean()
@@ -109,9 +102,7 @@ class KDModule(LightningModule):
             cls_loss_weight, kd_loss_weight = calculate_loss_weights(self.current_epoch, self.trainer.max_epochs)
 
             if self.ddk_enabled:
-                # =======================================================
-                # DDK 专属逻辑区 (只有 ddk_enabled=True 时才执行，不浪费基线算力)
-                # =======================================================
+                # DDK: compute per-sample KD gap and apply domain-aware reweighting
                 hidden_features, out, clip_img_features, clip_nlp_features, aligned_img, aligned_nlp = outputs
                 with torch.no_grad():
                     per_sample_img_gap = (hidden_features - aligned_img).abs().mean(dim=-1)
@@ -125,7 +116,7 @@ class KDModule(LightningModule):
                     ).sum(dim=1) * (temp ** 2)
                     per_sample_kd_gap = per_sample_img_gap + per_sample_kl
 
-                # DAR 域权重加权
+                # DAR: domain-aware reweighting
                 sample_weights = self.domain_weights[domain_ids]
                 weighted_cls_loss = (cls_loss_vec * sample_weights).mean()
                 batch_avg_weight = sample_weights.mean()
@@ -135,15 +126,20 @@ class KDModule(LightningModule):
                 final_loss = cls_loss_weight * weighted_cls_loss + (kd_loss_weight * weighted_img_loss + kd_loss_weight * weighted_kd_loss) / 2
                 
             else:
-                # =======================================================
-                # 严格的原版基线计算区
-                # =======================================================
+                # Baseline: original loss computation
                 cls_loss = cls_loss_weight * base_cls_loss
                 weighted_img_loss = kd_loss_weight * img_loss
                 weighted_kd_loss = kd_loss_weight * kd_loss
                 final_loss = cls_loss + (weighted_img_loss + weighted_kd_loss) / 2
 
             preds = torch.argmax(outputs[1], dim=1)
+            
+            # Extract teacher zero-shot predictions for domain-level analysis
+            hidden_feats, out, clip_img_feats, clip_nlp_feats = outputs[0], outputs[1], outputs[2], outputs[3]
+            with torch.no_grad():
+                teacher_logits = clip_img_feats @ clip_nlp_feats.T
+                teacher_preds = torch.argmax(teacher_logits, dim=1)
+            
             loss_dict.update({
                 "loss": final_loss, 
                 "cls_loss": base_cls_loss, 
@@ -169,15 +165,15 @@ class KDModule(LightningModule):
             cls_loss_vec.detach() if cls_loss_vec is not None else None,
             per_sample_kd_gap.detach() if per_sample_kd_gap is not None else None,
             domain_ids,
+            teacher_preds.detach() if teacher_preds is not None else None,
         )
 
     def training_step(self, batch, batch_idx):
-        loss, loss_dicts, preds, targets, cls_loss_vec, per_sample_kd_gap, domain_ids = self.model_step(batch)
+        loss, loss_dicts, preds, targets, cls_loss_vec, per_sample_kd_gap, domain_ids, _ = self.model_step(batch)
 
         self.train_loss(loss)
         self.train_acc(preds, targets)
         
-        # 恢复使用原本的 self.log 以确保格式完全对齐
         self.log("train/loss", self.train_loss, on_step=False, on_epoch=True, prog_bar=True)
         self.log("train/acc", self.train_acc, on_step=False, on_epoch=True, prog_bar=True)
 
@@ -189,7 +185,7 @@ class KDModule(LightningModule):
             self.log("train/img_loss", self.img_loss, on_step=False, on_epoch=True, prog_bar=True)
             self.log("train/kd_loss", self.kd_loss, on_step=False, on_epoch=True, prog_bar=True)
 
-        # DDK 独有的本地数据累加
+        # Accumulate per-domain statistics for DDK
         if self.ddk_enabled and self.training:
             with torch.no_grad():
                 for d in range(self.hparams.num_domains):
@@ -204,7 +200,7 @@ class KDModule(LightningModule):
         return loss
 
     def on_train_epoch_end(self) -> None:
-        """基于本地统计数据的域难度评估与权重更新 (仅 DDK 开启时执行)"""
+        """Domain difficulty estimation and weight update (DDK only)."""
         if not self.ddk_enabled or self._local_sample_count is None:
             return
 
@@ -227,55 +223,42 @@ class KDModule(LightningModule):
         base_difficulty = self.hparams.tsd_alpha * norm_cls + (1 - self.hparams.tsd_alpha) * norm_kd
         domain_difficulty = base_difficulty ** 2.0 
 
-        # ============================================================
-        # 🚀 自适应数据驱动退火 (完全基于 cls_loss 的真实进度)
-        # ============================================================
+        # Adaptive data-driven annealing based on cls_loss progress
         current_global_cls_loss = avg_cls_loss[valid_mask].mean().item()
 
-        # 1. 记录初始分类 Loss 作为基准点
         if getattr(self, "initial_base_loss", None) is None or self.current_epoch == 0:
             self.initial_base_loss = current_global_cls_loss
 
-        # 2. 计算纯分类 Loss 下降的比例
         drop_ratio = (self.initial_base_loss - current_global_cls_loss) / (self.initial_base_loss + 1e-6)
-
-        # 3. 设定目标阈值：根据 TensorBoard 曲线，设定为 0.70 最稳妥
         target_drop = 0.70 
-        
-        # 将其映射到 0~1 的进度条
         progress = max(0.0, min(drop_ratio / target_drop, 1.0))
 
-        # 4. 余弦退火公式 
+        # Cosine annealing for temperature
         T_max = 3.0 
         T_min = 0.2 
         dynamic_temp = T_min + 0.5 * (T_max - T_min) * (1.0 + math.cos(math.pi * progress))
-        # ============================================================
 
         new_weights = F.softmax(domain_difficulty / dynamic_temp, dim=0) * self.hparams.num_domains
         
-       # ============================================================
-        # 🛡️ 优化防掉点机制：非对称动量平滑 (Asymmetric EMA)
-        # ============================================================
-        new_weights = torch.clamp(new_weights, min=0.65, max=1.45)
+        # Asymmetric Momentum Smoothing (AMS)
+        new_weights = torch.clamp(new_weights, min=0.65, max=1.35)
         
-        perfect_threshold = 0.05
+        # Adaptive quantile threshold for mastered-domain detection
+        perfect_threshold = torch.quantile(avg_cls_loss[valid_mask], 0.2).item()
         is_perfect = (avg_cls_loss < perfect_threshold) & valid_mask
         
-        # 动态生成平滑动量 beta
-        # 正常域 beta = 0.8，完美域 beta = 0.98 (极强惯性，抵御剧烈下降)
+        # Higher beta for mastered domains to resist drastic weight drops
         dynamic_beta = torch.full_like(self.domain_weights, 0.8)
         dynamic_beta[is_perfect] = 0.98
         
-        # 使用动态 beta 进行更新
         self.domain_weights.copy_(dynamic_beta * self.domain_weights + (1 - dynamic_beta) * new_weights)
-        # ============================================================
 
         if hasattr(self.trainer, 'datamodule') and hasattr(self.trainer.datamodule, 'update_domain_weights'):
             self.trainer.datamodule.update_domain_weights(self.domain_weights.cpu().clone())
 
         if self.trainer.is_global_zero and self.current_epoch % 10 == 0:
-            print(f"\n📊 [TSD Epoch {self.current_epoch}] 域难度评估报告 (退火温度: {dynamic_temp:.3f}, 进度: {progress*100:.1f}%)")
-            print(f" {'域':^4} | {'难度':^8} | {'权重':^8} | {'分类损失':^8} | {'样本数':^6}")
+            print(f"\n[TSD Epoch {self.current_epoch}] Temp: {dynamic_temp:.3f}, Progress: {progress*100:.1f}%")
+            print(f" {'Dom':^4} | {'Diff':^8} | {'Weight':^8} | {'ClsLoss':^8} | {'Count':^6}")
             for d in range(self.hparams.num_domains):
                 if self._local_sample_count[d] > 0:
                     print(f" {d:02d}   | {domain_difficulty[d]:8.4f} | {self.domain_weights[d]:8.3f} "
@@ -287,7 +270,7 @@ class KDModule(LightningModule):
         self._local_sample_count.zero_()
 
     def validation_step(self, batch, batch_idx):
-        loss, _, preds, targets, _, _, _ = self.model_step(batch)
+        loss, _, preds, targets, _, _, _, _ = self.model_step(batch)
         self.val_loss(loss)
         self.val_acc(preds, targets)
         self.log("val/loss", self.val_loss, on_step=False, on_epoch=True, prog_bar=True)
@@ -299,21 +282,22 @@ class KDModule(LightningModule):
         self.log("val/acc_best", self.val_acc_best.compute(), sync_dist=True, prog_bar=True)
 
     def test_step(self, batch, batch_idx):
-        loss, _, preds, targets, cls_loss_vec, per_sample_kd_gap, domain_ids = self.model_step(batch)
+        loss, _, preds, targets, cls_loss_vec, per_sample_kd_gap, domain_ids, teacher_preds = self.model_step(batch)
         self.test_loss(loss)
         self.test_acc(preds, targets)
         self.log("test/loss", self.test_loss, on_step=False, on_epoch=True, prog_bar=True)
         self.log("test/acc", self.test_acc, on_step=False, on_epoch=True, prog_bar=True)
 
-        # 【核心修改】：无视 ddk_enabled 开关，只要有 domain_ids，全收集！
         output = {
             "preds": preds,
             "targets": targets,
         }
         if domain_ids is not None:
             output["domain_ids"] = domain_ids
-            # Baseline 可能没有逐样本的 cls_loss_vec，给它填 0 防止维度对齐报错
             output["cls_loss"] = cls_loss_vec if cls_loss_vec is not None else torch.zeros_like(preds, dtype=torch.float)
+        
+        if teacher_preds is not None:
+            output["teacher_preds"] = teacher_preds
                 
         self.test_step_outputs.append(output)
 
@@ -321,23 +305,28 @@ class KDModule(LightningModule):
         if not self.test_step_outputs:
             return
 
-        # 1. 局部拼接
         local_preds = torch.cat([x["preds"] for x in self.test_step_outputs])
         local_targets = torch.cat([x["targets"] for x in self.test_step_outputs])
         has_domains = "domain_ids" in self.test_step_outputs[0]
+        has_teacher = "teacher_preds" in self.test_step_outputs[0]
         
         if has_domains:
             local_domains = torch.cat([x["domain_ids"] for x in self.test_step_outputs])
             local_cls_loss = torch.cat([x["cls_loss"] for x in self.test_step_outputs])
+        
+        if has_teacher:
+            local_teacher_preds = torch.cat([x["teacher_preds"] for x in self.test_step_outputs])
 
-        # 2. 全局多卡收集 (all_gather)
+        # All-gather across GPUs (must be called by all ranks)
         all_preds = self.all_gather(local_preds).view(-1)
         all_targets = self.all_gather(local_targets).view(-1)
         if has_domains:
             all_domains = self.all_gather(local_domains).view(-1)
             all_cls_loss = self.all_gather(local_cls_loss).view(-1)
+        if has_teacher:
+            all_teacher_preds = self.all_gather(local_teacher_preds).view(-1)
 
-        # 3. 主进程打印与保存
+        # Print and save results on rank 0
         if self.trainer.is_global_zero:
             all_preds = all_preds.cpu()
             all_targets = all_targets.cpu()
@@ -357,20 +346,16 @@ class KDModule(LightningModule):
             save_path = "baseline_class_metrics.json"
             with open(save_path, "w") as f:
                 json.dump(class_metrics, f, indent=4)
-            print(f"\n✅ [DDK 预处理] 错题本已成功生成并保存至: {save_path}")
+            print(f"\n[DDK] Per-class metrics saved to: {save_path}")
 
-            # =======================================================
-            # 【核心修改】：无视 ddk_enabled 限制，只要有域信息就强制打印报告！
-            # =======================================================
             if has_domains:
                 all_domains = all_domains.cpu()
                 all_cls_loss = all_cls_loss.cpu()
                 
-                print(f"\n📊 [Baseline vs DDK 对比评估] 细粒度域评估报告")
-                print(f" {'域':^4} | {'准确率':^8} | {'分类损失':^8} | {'样本数':^6}")
+                print(f"\n[Domain Evaluation Report]")
+                print(f" {'Dom':^4} | {'Acc':^8} | {'ClsLoss':^8} | {'Count':^6}")
                 
                 domain_stats = []
-                # 注意：你之前设置的是 num_domains=10，这里会完整打印有数据的域
                 for d in range(self.hparams.num_domains):
                     mask = (all_domains == d)
                     total = mask.sum().item()
@@ -381,8 +366,51 @@ class KDModule(LightningModule):
                         domain_stats.append(acc)
 
                 if domain_stats:
-                    print(f"\n 📈 汇总 -> 平均准确率: {np.mean(domain_stats)*100:.2f}%, 准确率标准差: {np.std(domain_stats)*100:.2f}%\n")
-            
+                    print(f"\n Mean Acc: {np.mean(domain_stats)*100:.2f}%, Std: {np.std(domain_stats)*100:.2f}%\n")
+
+            # Teacher-student domain-level comparison
+            if has_domains and has_teacher:
+                all_teacher_preds = all_teacher_preds.cpu()
+
+                print(f"\n{'='*70}")
+                print(f"[D3KD] Teacher-Student Domain Gap Analysis")
+                print(f"{'='*70}")
+                print(f" {'Dom':^4} | {'Teacher':^12} | {'Student':^12} | {'Gap(T-S)':^10} | {'Count':^6}")
+                print(f" {'-'*4}-+-{'-'*12}-+-{'-'*12}-+-{'-'*10}-+-{'-'*6}")
+
+                comparison_data = {}
+                teacher_accs, student_accs, gaps = [], [], []
+
+                for d in range(self.hparams.num_domains):
+                    mask = (all_domains == d)
+                    total = mask.sum().item()
+                    if total > 0:
+                        t_acc = (all_teacher_preds[mask] == all_targets[mask]).sum().item() / total
+                        s_acc = (all_preds[mask] == all_targets[mask]).sum().item() / total
+                        gap = t_acc - s_acc
+                        print(f" {d:02d}   | {t_acc*100:10.2f}% | {s_acc*100:10.2f}% | {gap*100:+8.2f}% | {total:6d}")
+                        teacher_accs.append(t_acc)
+                        student_accs.append(s_acc)
+                        gaps.append(gap)
+                        comparison_data[str(d)] = {
+                            "teacher_acc": round(t_acc * 100, 2),
+                            "student_acc": round(s_acc * 100, 2),
+                            "gap": round(gap * 100, 2),
+                            "sample_count": total,
+                        }
+
+                if teacher_accs:
+                    print(f"\n Teacher Mean: {np.mean(teacher_accs)*100:.2f}%, "
+                          f"Student Mean: {np.mean(student_accs)*100:.2f}%, "
+                          f"Avg Gap: {np.mean(gaps)*100:.2f}%, "
+                          f"Gap Std: {np.std(gaps)*100:.2f}%")
+                print(f"{'='*70}\n")
+
+                comparison_json_path = "domain_teacher_student_comparison.json"
+                with open(comparison_json_path, "w") as f:
+                    json.dump(comparison_data, f, indent=4, ensure_ascii=False)
+                print(f"Domain comparison saved to: {comparison_json_path}")
+
         self.test_step_outputs.clear()
 
     def setup(self, stage: str) -> None:

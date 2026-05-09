@@ -26,8 +26,6 @@ class KDDataModule(LightningDataModule):
     ) -> None:
         super().__init__()
 
-        # this line allows to access init params with 'self.hparams' attribute
-        # also ensures init params will be stored in ckpt
         self.save_hyperparameters(logger=False)
 
         self.data_train: Optional[Dataset] = train_dataset.dataloader
@@ -36,11 +34,7 @@ class KDDataModule(LightningDataModule):
 
         self.batch_size_per_device = batch_size
 
-        # ============================================================
-        # [DAR - Sampling Reweighting] 域采样权重
-        # 由 KDModule 在每个 epoch 结束后通过 update_domain_weights() 更新
-        # None 表示使用均匀随机采样（默认行为）
-        # ============================================================
+        # Domain sampling weights, updated by KDModule at each epoch end. None = uniform sampling.
         self._domain_weights: Optional[torch.Tensor] = None
 
     @property
@@ -51,7 +45,6 @@ class KDDataModule(LightningDataModule):
         pass
 
     def setup(self, stage: Optional[str] = None) -> None:
-        # Divide batch size by the number of devices.
         if self.trainer is not None:
             if self.hparams.batch_size % self.trainer.world_size != 0:
                 raise RuntimeError(
@@ -60,42 +53,25 @@ class KDDataModule(LightningDataModule):
             self.batch_size_per_device = self.hparams.batch_size // self.trainer.world_size
 
     def update_domain_weights(self, weights: torch.Tensor) -> None:
-        """
-        [DAR] 更新域采样权重。
-        由 KDModule.on_train_epoch_end() 在每个 epoch 结束后调用。
-
-        参数:
-            weights: 域权重张量，形状为 (num_domains,)，
-                     较大的值表示该域更难、需要更多采样
-        """
+        """Update domain sampling weights. Called by KDModule.on_train_epoch_end()."""
         self._domain_weights = weights
 
     def train_dataloader(self) -> DataLoader[Any]:
-        """
-        创建训练 DataLoader。
-
-        [DAR - Sampling Reweighting 路径]
-        当域权重可用且数据集支持 domain_id 时，使用 WeightedRandomSampler
-        让难域的样本在每个 epoch 中被采样更多次。
-        否则退回标准的均匀随机 shuffle。
-        """
+        """Create training DataLoader with optional weighted sampling."""
         sampler = None
         shuffle = True
 
-        # [DAR] 如果有域权重且数据集提供了域信息，启用加权采样
-        # ⚠️ 注意: 为防止“双重惩罚”(Double Reweighting)，我们在 Loss 层保留了域权重，
-        # 在采样层暂时关闭加权随机采样。保证模型能均匀地看到所有的简单样本，
-        # 同时利用 Loss Reweighting 在困难样本上拉大梯度。
+        # NOTE: Weighted sampling is disabled to avoid double-reweighting with loss reweighting.
+        # Kept here for reference if sampling-based reweighting is needed.
         # if self._domain_weights is not None and hasattr(self.data_train, 'domains'):
         #     domains = torch.tensor(self.data_train.domains, dtype=torch.long)
-        #     # 每个样本的采样权重 = 其所属域的权重
         #     sample_weights = self._domain_weights[domains].double()
         #     sampler = WeightedRandomSampler(
         #         weights=sample_weights,
-        #         num_samples=len(self.data_train),  # 保持每个 epoch 的总样本数不变
-        #         replacement=True,  # 允许重复采样（难域样本可能被采多次）
+        #         num_samples=len(self.data_train),
+        #         replacement=True,
         #     )
-        #     shuffle = False  # WeightedRandomSampler 与 shuffle 互斥
+        #     shuffle = False
 
         return DataLoader(
             dataset=self.data_train,
@@ -129,17 +105,17 @@ class KDDataModule(LightningDataModule):
         pass
 
     def state_dict(self) -> Dict[Any, Any]:
-        """保存 DataModule 状态到 checkpoint。"""
+        """Save DataModule state to checkpoint."""
         state = {}
         if self._domain_weights is not None:
             state['domain_weights'] = self._domain_weights
         return state
 
     def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
-        """从 checkpoint 恢复 DataModule 状态。"""
+        """Restore DataModule state from checkpoint."""
         if 'domain_weights' in state_dict:
             self._domain_weights = state_dict['domain_weights']
-            print("[DAR] 已从 checkpoint 恢复域采样权重")
+            print("[DAR] Restored domain weights from checkpoint")
 
 
 if __name__ == "__main__":

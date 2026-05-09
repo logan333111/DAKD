@@ -1,5 +1,5 @@
 defaults:
-  - attributes: 8_CALTECH256
+  - attributes: 6_StanfordCars
 
 data_name: ${data.attributes.name}
 _target_: src.data.kd_datamodule.KDDataModule
@@ -9,6 +9,7 @@ train_dataset:
   data_root: ${paths.data_dir}${data.data_name}${data.attributes.sub_dir}
   attributes: ${data.attributes}
   split: train
+  num_domains: ${oc.select:model.num_domains,10}
 
 test_dataset:
   _target_ : src.data.components.kd_dataloader.KDDataset
@@ -16,9 +17,9 @@ test_dataset:
   data_root: ${paths.data_dir}${data.data_name}${data.attributes.sub_dir}
   attributes: ${data.attributes}
   split: test
+  num_domains: ${oc.select:model.num_domains,10}
 
 
 batch_size: 256 # Needs to be divisible by the number of devices (e.g., if in a distributed setup)
 num_workers: 16
 pin_memory: False
-

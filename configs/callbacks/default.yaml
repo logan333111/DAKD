@@ -13,12 +13,12 @@ model_checkpoint:
   mode: "max"
   save_last: True
   auto_insert_metric_name: False
-  start_epoch: 100       # 前50轮不保存，之后才开始保存最佳权重
-  save_top_k: 1          # 只保留1个最佳权重（新的更好时自动删除旧的）
+  start_epoch: 100     # Skip first 100 epochs, then start saving best weights
+  save_top_k: 1          # Keep only the best checkpoint
 
 early_stopping:
   monitor: "val/acc"
-  patience: 80
+  patience: 20
   mode: "max"
 
 model_summary:

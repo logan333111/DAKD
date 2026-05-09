@@ -2,7 +2,7 @@
 
 model_checkpoint:
   _target_: src.callbacks.delayed_checkpoint.DelayedModelCheckpoint
-  start_epoch: 25  # 前50轮不保存
+  start_epoch: 25  # Skip early epochs before saving
   dirpath: null # directory to save the model file
   filename: null # checkpoint filename
   monitor: null # name of the logged metric which determines when model is improving

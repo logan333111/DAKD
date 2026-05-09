@@ -2,7 +2,7 @@ ______________________________________________________________________
 
 <div align="center">
 
-# VL2Lite: Task-Specific Knowledge Distillation from Large Vision-Language Models to Lightweight Networks
+# DAKD: Difficulty-Aware Knowledge Distillation from Vision-Language Models
 
 <a href="https://pytorch.org/get-started/locally/">
   <img alt="PyTorch" src="https://img.shields.io/badge/PyTorch-ee4c2c?logo=pytorch&logoColor=white">
@@ -17,7 +17,8 @@ ______________________________________________________________________
   <img alt="Template" src="https://img.shields.io/badge/-Lightning--Hydra--Template-017F2F?style=flat&logo=github&labelColor=gray">
 </a>
 <br>
-[![Conference](http://img.shields.io/badge/CVPR%202025-Paper-4b44ce.svg)](#)
+
+[![Conference](http://img.shields.io/badge/NeurIPS%202026-Paper-4b44ce.svg)](#)
 
 </div>
 
@@ -26,9 +27,10 @@ ______________________________________________________________________
 ## Description
 
 This repository contains the **official implementation** of the paper:
-"VL2Lite: Task-Specific Knowledge Distillation from Large Vision-Language Models to Lightweight Networks".
 
-This repository provides a **PyTorch Lightning + Hydra** codebase for distilling knowledge from large Vision-Language Models (VLMs) (e.g., CLIP-like models) to smaller, resource-efficient neural networks. By leveraging multi-modal embeddings (visual & textual) from a **frozen** VLM, VL2Lite significantly boosts performance in fine-grained classification tasks without extra teacher fine-tuning overhead.
+> **"Not All Data Are Equal: Difficulty-Aware Distillation from Vision-Language Models"**
+
+DAKD is a **PyTorch Lightning + Hydra** framework for distilling knowledge from large frozen Vision-Language Models (e.g., CLIP) into lightweight student networks. 
 
 ---
 
@@ -37,7 +39,7 @@ This repository provides a **PyTorch Lightning + Hydra** codebase for distilling
 - **Frozen VLM Teacher**: No teacher fine-tuning required  
 - **Condensation Layers**: Reduce dimensionality for both image and text embeddings  
 - **Multi-Loss**: Classification loss + Visual KD + Linguistic KD  
-- **Dynamic Weighting**: Gradually shifts from KD to classification emphasis  
+- **Difficulty-Aware Reweighting**: Dynamic domain-level optimisation weights  
 - **Configurable**: Hydra-based setup for custom data, model, or experiment scripts
 
 ---
@@ -46,22 +48,17 @@ This repository provides a **PyTorch Lightning + Hydra** codebase for distilling
 
 1. **Clone project**:
    ```bash
-   git clone https://github.com/jsjangAI/VL2Lite
-   cd vl2lite
+   git clone https://github.com/YOUR_USERNAME/DAKD.git
+   cd DAKD
    ```
 
 2. *(Optional)* **Create conda environment**:
    ```bash
-   conda create -n vl2lite_env python=3.9
-   conda activate vl2lite_env
+   conda env create -f environment.yaml
+   conda activate dakd
    ```
 
-3. **Install PyTorch** per [official instructions](https://pytorch.org/get-started/).
-
-4. **Install requirements**:
-   ```bash
-   pip install -r requirements.txt
-   ```
+3. **Install PyTorch** per [official instructions](https://pytorch.org/get-started/) if not included in the environment.
 
 ---
 
@@ -69,7 +66,7 @@ This repository provides a **PyTorch Lightning + Hydra** codebase for distilling
 
 If your dataset is in a different path, create a soft link:
 ```bash
-ln -s ./data/kd_datasets /data/KD_datasets
+ln -s /your/dataset/path ./data/kd_datasets
 ```
 Update `configs/data/` if needed.
 
@@ -91,6 +88,25 @@ We use [PyTorch Lightning](https://www.pytorchlightning.ai/) for training loops 
   python src/train.py trainer=gpu
   ```
 
+- **Train with DAKD** (multi-GPU):
+  ```bash
+  CUDA_VISIBLE_DEVICES=0,1,2,3 python src/train.py \
+      trainer=ddp trainer.devices=4 \
+      model.use_teacher=true \
+      model.ddk_enabled=true \
+      model.net.student.arch=resnet18 \
+      data/attributes=0_CUB_200_2011 \
+      logger=tensorboard
+  ```
+
+- **Train Baseline** (without DAKD):
+  ```bash
+  python src/train.py \
+      model.use_teacher=true \
+      model.ddk_enabled=false \
+      data/attributes=0_CUB_200_2011
+  ```
+
 ### Experiment Configs
 
 Pick a config from `configs/experiment/`:
@@ -101,7 +117,13 @@ and you can override any parameter:
 ```bash
 python src/train.py trainer.max_epochs=20 data.batch_size=64
 ```
-*(See `src/train.sh` for an example script.)*
+
+The default student backbone is `mobilenet_v2`. To override it from the command line:
+```bash
+python src/train.py model.net.student.arch=resnet18
+```
+
+*(See `src/train.sh` for example scripts.)*
 
 ---
 
@@ -116,23 +138,21 @@ Hydra allows combining or overriding these configs easily.
 
 ---
 
-## Acknowledgments
-
-Built upon the [Lightning-Hydra-Template](https://github.com/ashleve/lightning-hydra-template).  
-We thank open-source projects (PyTorch, Lightning, Hydra) that enable this work.
+Built upon the [Lightning-Hydra-Template](https://github.com/ashleve/lightning-hydra-template).   
+We thank open-source projects (PyTorch, Lightning, Hydra, OpenCLIP) that enable this work.
 
 ---
 
 ## Citation
 
-If you use this code or find VL2Lite helpful, please cite:
+If you use this code or find DAKD helpful, please cite:
 
 ```bibtex
-@misc{jang2025vl2lite,
-  title={VL2Lite: Task-Specific Knowledge Distillation from Large Vision-Language Models to Lightweight Networks},
-  author={Jang, Jinseong and Ma, Chunfei and Lee, Byeongwon},
-  journal={CVPR},
-  year={2025}
+@inproceedings{dakd2026,
+  title={Not All Data Are Equal: Difficulty-Aware Distillation from Vision-Language Models},
+  author={},
+  booktitle={NeurIPS},
+  year={2026}
 }
 ```
 
@@ -142,5 +162,3 @@ If you use this code or find VL2Lite helpful, please cite:
 
 This project is licensed under the [MIT License](LICENSE).
 Please see the [LICENSE](LICENSE) file for details.
-
-```  

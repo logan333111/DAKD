@@ -1,12 +1,8 @@
-# ====================================================================================
-# 简化DDK回调配置 - simple_ddk_callbacks.yaml
-# ====================================================================================
-
+# DDK callback config
 defaults:
-  - default  # 继承默认回调
+  - default
 
-# 简化DDK回调
 simple_ddk:
   _target_: src.callbacks.simple_ddk_callback.SimpleDDKCallback
-  update_interval: 1  # 每个epoch更新DDK权重
-  warmup_epochs: 5    # 预热5个epoch后开始DDK采样
+  update_interval: 1    # Update DDK weights every N epochs
+  warmup_epochs: 5      # Start DDK sampling after warmup

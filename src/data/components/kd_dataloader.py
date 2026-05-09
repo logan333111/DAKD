@@ -29,37 +29,51 @@ class RandomCropAndResize(object):
 
 
 class KDDataset(Dataset):
-    def __init__(self, data_name, data_root, attributes, split='train'):
+    def __init__(self, data_name, data_root, attributes, split='train', num_domains=10):
         self.root_dir = data_root
         self.split = split
+        self.num_domains = num_domains or 10
         self.transform = self.get_transform(split)
-        self.dataloader = self.get_dataloader(data_name)
         self.attributes = attributes #prompt_tmpl, class_num, classes
+        self.dataloader = self.get_dataloader(data_name)
 
     def get_transform(self, split):
-        # 注意：这里原作者使用的是 CLIP/VLM 特有的 Normalize 参数，非常关键，我们保持绝对不变！
         normalize = transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
             std=[0.26862954, 0.26130258, 0.27577711])       
-            
         if split == 'train':
+
+            use_randaugment = True
+
+            if use_randaugment:
+                return transforms.Compose([
+                    transforms.Resize((256, 256)),
+                    transforms.RandomCrop((224, 224)),
+                    transforms.RandomHorizontalFlip(),
+                    transforms.RandAugment(num_ops=2, magnitude=6),
+                    transforms.ToTensor(),
+                    normalize,
+                    #transforms.RandomErasing(p=0.5, scale=(0.02, 0.33), ratio=(0.3, 3.3)),
+                    ])
+
             return transforms.Compose([
                 transforms.Resize((256, 256)),
+                #transforms.Pad(10),
+                #transforms.Pad(20),
                 transforms.RandomCrop((224, 224)),
+                #transforms.CenterCrop((224, 224)),
+                RandomCropAndResize(min_crop_size=192, max_crop_size=224, final_size=224),
+                transforms.RandomRotation(60, interpolation = PIL.Image.BILINEAR),
+                transforms.GaussianBlur(kernel_size=(5, 5), sigma=(0.00001, 10)),
+                transforms.ColorJitter(brightness=.3, contrast=.1, saturation=.1, hue=.1),
                 transforms.RandomHorizontalFlip(),
-                
-                # 【核心替换】：用一句话的 RandAugment，替代原代码里那一大堆手动写的增强！
-                # num_ops=2 表示每次随机选 2 种操作，magnitude=9 表示中等偏上的增强强度
-                transforms.RandAugment(num_ops=2, magnitude=6),
-                
                 transforms.ToTensor(),
                 normalize,
-                # 原作者注释掉的 RandomErasing (随机擦除) 其实防过拟合也很好，
-                # 如果加上 RandAugment 还是过拟合，你可以把下面这行取消注释
-                # transforms.RandomErasing(p=0.5, scale=(0.02, 0.33), ratio=(0.3, 3.3)),
+                #transforms.RandomErasing(p=0.5, scale=(0.3, 0.5), ratio=(0.3, 3.3),),
                 ])
         else:
             return transforms.Compose([
-                        # 验证集保持干净，不做任何干扰
+                        # transforms.Scale(256),
+                        # transforms.CenterCrop(224),
                         transforms.Resize((224, 224)),
                         transforms.ToTensor(),
                         normalize,
@@ -67,27 +81,27 @@ class KDDataset(Dataset):
 
     def get_dataloader(self, data_name):
         if data_name == '0_CUB_200_2011':
-            return CUB200Dataset(self.root_dir, split=self.split, transform=self.transform)
+            return CUB200Dataset(self.root_dir, split=self.split, transform=self.transform, num_domains=self.num_domains)
         elif data_name == '1_FGVC_AIRCRAFT':
-            return AircraftDataset(self.root_dir, split=self.split, transform=self.transform)
+            return AircraftDataset(self.root_dir, split=self.split, transform=self.transform, num_domains=self.num_domains)
         elif data_name == '2_NABirds':
-            return NABirdsDataset(self.root_dir, split=self.split, transform=self.transform)
+            return NABirdsDataset(self.root_dir, split=self.split, transform=self.transform, num_domains=self.num_domains)
         elif data_name == '3_DTD':
-            return DTDDataset(self.root_dir, split=self.split, transform=self.transform)
+            return DTDDataset(self.root_dir, split=self.split, transform=self.transform, num_domains=self.num_domains)
         elif data_name == '4_OxfordIIITPet':
-            return OxfordIIPetDataset(self.root_dir, split=self.split, transform=self.transform)
+            return OxfordIIPetDataset(self.root_dir, split=self.split, transform=self.transform, attributes=self.attributes, num_domains=self.num_domains)
         elif data_name == '5_StanfordDogs':
-            return StanfordDogsDataset(self.root_dir, split=self.split, transform=self.transform)
+            return StanfordDogsDataset(self.root_dir, split=self.split, transform=self.transform, num_domains=self.num_domains)
         elif data_name == '6_StanfordCars':
             return StanfordCarsDataset(self.root_dir, split=self.split, transform=self.transform)
         elif data_name == '7_CALTECH101':
             return Caltech101Dataset(self.root_dir, split=self.split, transform=self.transform)
         elif data_name == '8_CALTECH256':
-            return Caltech256Dataset(self.root_dir, split=self.split, transform=self.transform)
+            return Caltech256Dataset(self.root_dir, split=self.split, transform=self.transform, num_domains=self.num_domains)
         elif data_name == '9_GTSRB':
             return GTSRBTestDataset(self.root_dir, split=self.split, transform=self.transform)
         elif data_name == '10_Oxford102Flowers':
-            return Oxford102FlowersDataset(self.root_dir, split=self.split, transform=self.transform)
+            return Oxford102FlowersDataset(self.root_dir, split=self.split, transform=self.transform, num_domains=self.num_domains)
 
     def __len__(self):
         return len(self.dataloader)
@@ -129,7 +143,7 @@ from PIL import Image
 from torch.utils.data import Dataset
 
 class CUB200Dataset(Dataset):
-    def __init__(self, root_dir, split="train", transform=None):
+    def __init__(self, root_dir, split="train", transform=None, num_domains=10):
         assert split in ["train", "test"], "split should be either 'train' or 'test'"
         
         self.root_dir = root_dir
@@ -137,41 +151,37 @@ class CUB200Dataset(Dataset):
         self.labels = []
         self.split = split
 
-        # 加载 train/test split
+        # Load train/test split
         splits = []
         with open(os.path.join(root_dir, 'train_test_split.txt'), 'r') as f:
             for line in f:
                 _, is_train = line.strip().split(' ')
                 splits.append(int(is_train))
         
-        # 加载图片路径
+        # Load image paths
         with open(os.path.join(root_dir, 'images.txt'), 'r') as f:
             for idx, line in enumerate(f):
                 img_id, img_path = line.strip().split(' ')
-                # 根据 split 筛选
                 if (split == "train" and splits[idx] == 1) or (split == "test" and splits[idx] == 0):
                     self.image_paths.append(os.path.join(root_dir, 'images', img_path))
                 
-        # 加载图片类别标签
+        # Load class labels
         with open(os.path.join(root_dir, 'image_class_labels.txt'), 'r') as f:
             for idx, line in enumerate(f):
                 _, label = line.strip().split(' ')
                 if (split == "train" and splits[idx] == 1) or (split == "test" and splits[idx] == 0):
                     self.labels.append(int(label))
         
-        # =======================================================
-        # [DDK 新增] 预先加载基于类别的 Domain 映射表 (class_id -> domain_id)
-        # =======================================================
-        domain_json_path = os.path.join(root_dir, 'class_to_domain_10.json')
+        # Load class-to-domain mapping
+        domain_json_path = os.path.join(root_dir, f'class_to_domain_{num_domains}.json')
         if os.path.exists(domain_json_path):
             import json
             with open(domain_json_path, 'r') as f:
                 self.class_domain_map = json.load(f)
-            # 仅在训练集打印一次，避免刷屏
             if split == "train":
-                print(f"✅ [DDK] 成功加载 CUB200 类别难度分域表: {domain_json_path}")
+                print(f"[DDK] Loaded domain map: {domain_json_path}")
         else:
-            print(f"[Warning] 找不到 {domain_json_path}，所有鸟类品种默认分配到 Domain 0")
+            print(f"[Warning] Domain map not found: {domain_json_path}, defaulting to domain 0")
             self.class_domain_map = {}
 
         self.transform = transform
@@ -181,33 +191,20 @@ class CUB200Dataset(Dataset):
 
     def __getitem__(self, idx):
         img_path = self.image_paths[idx]
-        # 注意：有些环境可能需要 .convert('RGB') 来处理灰度图
         image = Image.open(img_path).convert('RGB')
         
-        # CUB原始标签是从1开始的，这里转换为从0开始 (0~199)
-        label = self.labels[idx] - 1 
+        label = self.labels[idx] - 1  # Convert 1-based to 0-based
         
-        # =======================================================
-        # [DDK 新增] 直接根据真实的鸟类标签 (0~199) 获取 domain_id
-        # =======================================================
-        # 注意：假设 json 文件里的 key 是从 "0" 到 "199" 的字符串
         domain_id = self.class_domain_map.get(str(label), 0)
         
         if self.transform:
             image = self.transform(image)
         
-        # [DDK 修改] 返回三元组：图像，标签，领域ID
         return image, label, domain_id
 
 
 class DTDDataset(Dataset):
-    def __init__(self, root_dir, split="train", transform=None):
-        """
-        Args:
-            root_dir (str): DTD root directory
-            split (str): "train" 또는 "test".
-            transform (callable, optional): transform.
-        """
+    def __init__(self, root_dir, split="train", transform=None, num_domains=10):
         assert split in ["train", "test"], "split should be either 'train' or 'test'"
         
         self.root_dir = root_dir
@@ -221,7 +218,7 @@ class DTDDataset(Dataset):
         split_file = os.path.join(root_dir, 'train_test_split.txt')
         if not os.path.isfile(split_file):
             with open(split_file, 'w') as f:
-                # [安全修复] 使用 sorted() 保证每次生成的类别顺序一致！
+                # Use sorted() for deterministic class ordering
                 for category in sorted(os.listdir(img_path)):
                     category_path = os.path.join(img_path, category)
                     if os.path.isdir(category_path):
@@ -237,7 +234,7 @@ class DTDDataset(Dataset):
                 img_name, s = line.strip().split()
                 splits[img_name] = s
 
-        # [安全修复] 同样加上 sorted()，严格对齐 YAML 里的 0~46 类别顺序
+        # sorted() to align with YAML class ordering
         for label, category in enumerate(sorted(os.listdir(img_path))):
             category_path = os.path.join(img_path, category)
             if os.path.isdir(category_path):
@@ -246,19 +243,16 @@ class DTDDataset(Dataset):
                         self.image_paths.append(os.path.join(category_path, img_name))
                         self.labels.append(label)
 
-        # =======================================================
-        # [DDK 新增] 预先加载基于类别的 Domain 映射表 (class_id -> domain_id)
-        # =======================================================
-        domain_json_path = os.path.join(root_dir, 'class_to_domain_10.json')
+        # Load class-to-domain mapping
+        domain_json_path = os.path.join(root_dir, f'class_to_domain_{num_domains}.json')
         if os.path.exists(domain_json_path):
             import json
             with open(domain_json_path, 'r') as f:
                 self.class_domain_map = json.load(f)
-            # 仅在训练集打印一次，避免刷屏
             if split == "train":
-                print(f"✅ [DDK] 成功加载 DTD 类别难度分域表: {domain_json_path}")
+                print(f"[DDK] Loaded domain map: {domain_json_path}")
         else:
-            print(f"[Warning] 找不到 {domain_json_path}，所有材质品种默认分配到 Domain 0")
+            print(f"[Warning] Domain map not found: {domain_json_path}, defaulting to domain 0")
             self.class_domain_map = {}
 
         self.transform = transform
@@ -272,15 +266,11 @@ class DTDDataset(Dataset):
         
         label = self.labels[idx]
         
-        # =======================================================
-        # [DDK 新增] 直接根据真实的材质标签 (0~46) 获取 domain_id
-        # =======================================================
         domain_id = self.class_domain_map.get(str(label), 0)
         
         if self.transform:
             image = self.transform(image)
         
-        # [DDK 修改] 返回三元组：图像，标签，领域ID
         return image, label, domain_id
 
 
@@ -290,7 +280,7 @@ from PIL import Image
 from torch.utils.data import Dataset
 
 class AircraftDataset(Dataset):
-    def __init__(self, root_dir, split="train", transform=None):
+    def __init__(self, root_dir, split="train", transform=None, num_domains=10):
         assert split in ["train", "test", "val"], "split should be 'train', 'test', or 'val'"
         
         self.root_dir = root_dir
@@ -298,28 +288,25 @@ class AircraftDataset(Dataset):
         self.labels = []
         self.split = split
         
-        # 1. 标签映射 (获取类别名称到 class_id 的映射)
+        # Build class name -> class_id mapping
         label_map = {}
         with open(os.path.join(root_dir, 'data', 'variants.txt'), 'r') as f:
             for idx, line in enumerate(f):
                 class_name = line.strip()
                 label_map[class_name] = idx
 
-        # =======================================================
-        # [DDK 新增] 2. 预先加载基于类别的 Domain 映射表 (class_id -> domain_id)
-        # =======================================================
-        domain_json_path = os.path.join(root_dir, 'class_to_domain_10.json')
+        # Load class-to-domain mapping
+        domain_json_path = os.path.join(root_dir, f'class_to_domain_{num_domains}.json')
         if os.path.exists(domain_json_path):
             with open(domain_json_path, 'r') as f:
                 self.class_domain_map = json.load(f)
-            # 仅在训练集打印一次，避免刷屏
             if split == "train":
-                print(f"✅ [DDK] 成功加载 Aircraft 类别难度分域表: {domain_json_path}")
+                print(f"[DDK] Loaded domain map: {domain_json_path}")
         else:
-            print(f"[Warning] 找不到 {domain_json_path}，所有飞机品种默认分配到 Domain 0")
+            print(f"[Warning] Domain map not found: {domain_json_path}, defaulting to domain 0")
             self.class_domain_map = {}
 
-        # 3. 读取图片切分文件并加载路径与标签
+        # Load image paths and labels from split file
         with open(os.path.join(root_dir, 'data', f'images_variant_{split}.txt'), 'r') as f:
             for line in f:
                 line_split = line.strip().split(' ')
@@ -343,55 +330,46 @@ class AircraftDataset(Dataset):
         
         label = self.labels[idx]
         
-        # =======================================================
-        # [DDK 新增] 直接根据真实的飞机器种标签获取 domain_id
-        # =======================================================
-        # 注意：json 字典的 key 是字符串，所以这里用 str(label) 查询
         domain_id = self.class_domain_map.get(str(label), 0)
         
         if self.transform:
             image = self.transform(image)
         
-        # [DDK 修改] 返回三元组：图像，标签，领域ID
         return image, label, domain_id
 
 class NABirdsDataset(Dataset):
-    def __init__(self, root_dir, split="train", transform=None):
+    def __init__(self, root_dir, split="train", transform=None, num_domains=10):
         assert split in ["train", "test"], "split should be either 'train' or 'test'"
         
         self.root_dir = root_dir
         self.image_paths = []
         self.labels = []
         
-        # 1. 读取图片路径
+        # Load image paths
         with open(os.path.join(root_dir, 'images.txt'), 'r') as f:
             for line in f:
                 img_id, img_path = line.strip().split()
                 self.image_paths.append(os.path.join(root_dir, 'images', img_path))
 
-        # 2. 读取标签
+        # Load labels
         with open(os.path.join(root_dir, 'image_class_labels.txt'), 'r') as f:
             for line in f:
                 _, label = line.strip().split()
-                # 原始标签减 1，转换为 0-based 索引
-                self.labels.append(int(label) - 1)  
+                self.labels.append(int(label) - 1)  # Convert to 0-based
                 
-        # =======================================================
-        # [DDK 新增] 3. 预先加载基于类别的 Domain 映射表 (class_id -> domain_id)
-        # =======================================================
-        domain_json_path = os.path.join(root_dir, 'class_to_domain_10.json')
+        # Load class-to-domain mapping
+        domain_json_path = os.path.join(root_dir, f'class_to_domain_{num_domains}.json')
         if os.path.exists(domain_json_path):
             import json
             with open(domain_json_path, 'r') as f:
                 self.class_domain_map = json.load(f)
-            # 仅在训练集打印一次，避免刷屏
             if split == "train":
-                print(f"✅ [DDK] 成功加载 NABirds 类别难度分域表: {domain_json_path}")
+                print(f"[DDK] Loaded domain map: {domain_json_path}")
         else:
-            print(f"[Warning] 找不到 {domain_json_path}，所有鸟类品种默认分配到 Domain 0")
+            print(f"[Warning] Domain map not found: {domain_json_path}, defaulting to domain 0")
             self.class_domain_map = {}
         
-        # 4. 根据 train/test 划分过滤数据
+        # Filter by train/test split
         split_list = []
         with open(os.path.join(root_dir, 'train_test_split.txt'), 'r') as f:
             for line in f:
@@ -415,70 +393,83 @@ class NABirdsDataset(Dataset):
         image = Image.open(img_path).convert('RGB')
         label = self.labels[idx]
         
-        # =======================================================
-        # [DDK 新增] 直接根据真实的鸟类品种标签获取 domain_id
-        # =======================================================
         domain_id = self.class_domain_map.get(str(label), 0)
         
         if self.transform:
             image = self.transform(image)
         
-        # [DDK 修改] 返回三元组：图像，标签，领域ID
         return image, label, domain_id
 
 class OxfordIIPetDataset(Dataset):
-    def __init__(self, root_dir, split="train", transform=None):
-        """
-        Args:
-            root_dir (str): Oxford-IIIT Pet 데이터셋의 디렉터리 경로.
-            split (str): "train" 또는 "test".
-            transform (callable, optional): 적용할 변환(Optional).
-        """
+    def __init__(self, root_dir, split="train", transform=None, attributes=None, num_domains=10):
         assert split in ["train", "test"], "split should be either 'train' or 'test'"
 
         self.root_dir = root_dir
         self.image_paths = []
         self.labels = []
-        self.label_to_idx = {}
+        self.class_to_idx = self._build_class_to_idx(attributes)
 
         if split == "train":
             split_file = os.path.join(root_dir, "annotations", "trainval.txt")
         else:
             split_file = os.path.join(root_dir, "annotations", "test.txt")
 
-        # split 파일에서 이미지 경로와 레이블 정보 읽기
+        # Load class-to-domain mapping
+        domain_json_path = os.path.join(root_dir, f'class_to_domain_{num_domains}.json')
+        if os.path.exists(domain_json_path):
+            with open(domain_json_path, 'r') as f:
+                self.class_domain_map = json.load(f)
+            if split == "train":
+                print(f"[DDK] Loaded domain map: {domain_json_path}")
+        else:
+            print(f"[Warning] Domain map not found: {domain_json_path}, defaulting to domain 0")
+            self.class_domain_map = {}
+
+        # Load image paths and labels from split file
         with open(split_file, 'r') as file:
             for line in file:
                 img_name, label_id, _, _ = line.strip().split()
                 img_path = os.path.join(root_dir, "images", img_name + ".jpg")
-                if img_name.split('_')[0] not in self.label_to_idx:
-                    self.label_to_idx[img_name.split('_')[0]] = len(self.label_to_idx)
                 self.image_paths.append(img_path)
-                self.labels.append(self.label_to_idx[img_name.split('_')[0]])
+
+                class_name = self._normalize_class_name(img_name.rsplit('_', 1)[0])
+                if class_name in self.class_to_idx:
+                    self.labels.append(self.class_to_idx[class_name])
+                else:
+                    # Fallback to official 1-based label_id when attributes not provided
+                    self.labels.append(int(label_id) - 1)
         
         self.transform = transform
 
     def __len__(self):
         return len(self.image_paths)
 
+    @staticmethod
+    def _normalize_class_name(class_name):
+        return str(class_name).replace('_', ' ').lower()
+
+    def _build_class_to_idx(self, attributes):
+        if attributes is None or not hasattr(attributes, 'classes'):
+            return {}
+        return {
+            self._normalize_class_name(class_name): idx
+            for idx, class_name in enumerate(attributes.classes.values())
+        }
+
     def __getitem__(self, idx):
         img_path = self.image_paths[idx]
         image = Image.open(img_path).convert('RGB')
         label = self.labels[idx]
+
+        domain_id = self.class_domain_map.get(str(label), 0)
         
         if self.transform:
             image = self.transform(image)
         
-        return image, label
+        return image, label, domain_id
 
 class CalTech256Dataset(Dataset):
     def __init__(self, root_dir, split="train", transform=None):
-        """
-        Args:
-            root_dir (str): CalTech256 데이터셋의 디렉터리 경로.
-            split (str): "train" 또는 "test".
-            transform (callable, optional): 적용할 변환(Optional).
-        """
         assert split in ["train", "test"], "split should be either 'train' or 'test'"
         
         self.root_dir = root_dir
@@ -488,7 +479,7 @@ class CalTech256Dataset(Dataset):
         
         split_file = os.path.join(root_dir, "train_test_split.txt")
         
-        # 파일이 없으면 새로 생성
+        # Generate split file if not exists
         if not os.path.exists(split_file):
             with open(split_file, 'w') as file:
                 categories = sorted([d for d in os.listdir(root_dir) if os.path.isdir(os.path.join(root_dir, d)) and not d.startswith("BACKGROUND")])
@@ -506,7 +497,7 @@ class CalTech256Dataset(Dataset):
                     for img in test_images:
                         file.write(f"test {os.path.join(category, img)} {category}\n")
         
-        # train_test_split.txt에서 이미지 경로와 레이블 정보 읽기
+        # Load image paths and labels from split file
         with open(split_file, 'r') as file:
             for line in file:
                 mode, img_path, category = line.strip().split()
@@ -533,12 +524,6 @@ class CalTech256Dataset(Dataset):
 
 class CalTech101Dataset(Dataset):
     def __init__(self, root_dir, split="train", transform=None):
-        """
-        Args:
-            root_dir (str): CalTech101 데이터셋의 디렉터리 경로.
-            split (str): "train" 또는 "test".
-            transform (callable, optional): 적용할 변환(Optional).
-        """
         assert split in ["train", "test"], "split should be either 'train' or 'test'"
         
         self.root_dir = root_dir
@@ -548,7 +533,7 @@ class CalTech101Dataset(Dataset):
         
         split_file = os.path.join(root_dir, "train_test_split.txt")
         
-        # 파일이 없으면 새로 생성
+        # Generate split file if not exists
         if not os.path.exists(split_file):
             with open(split_file, 'w') as file:
                 categories = sorted([d for d in os.listdir(root_dir) if os.path.isdir(os.path.join(root_dir, d))])
@@ -566,7 +551,7 @@ class CalTech101Dataset(Dataset):
                     for img in test_images:
                         file.write(f"test {os.path.join(category, img)} {category}\n")
         
-        # train_test_split.txt에서 이미지 경로와 레이블 정보 읽기
+        # Load image paths and labels from split file
         with open(split_file, 'r') as file:
             for line in file:
                 mode, img_path, category = line.strip().split()
@@ -593,20 +578,14 @@ class CalTech101Dataset(Dataset):
 
 class StanfordCarsDataset(Dataset):
     def __init__(self, root_dir, split="train", transform=None):
-        """
-        Args:
-            root_dir (str): Stanford Cars 数据集根目录.
-            split (str): "train" 或 "test".
-            transform (callable, optional): 图像变换.
-        """
         assert split in ["train", "test"], "split should be either 'train' or 'test'"
         
         self.df = pd.read_csv(os.path.join(root_dir, f"{split}.csv"))
         self.img_dir = os.path.join(root_dir, "images")
         self.transform = transform
-        self.domains = []  # [DDK 新增] 用于存储每张图的 Domain ID
+        self.domains = []
         
-        # [DDK 新增] 预先加载 Domain 映射表 (filename -> domain_id)
+        # Load domain mapping (filename -> domain_id)
         domain_map = {}
         domain_file_path = os.path.join(root_dir, 'ddk_image_domain_labels.txt')
         if os.path.exists(domain_file_path):
@@ -617,37 +596,29 @@ class StanfordCarsDataset(Dataset):
         else:
             print(f"[Warning] DDK domain file not found at {domain_file_path}. Defaulting domains to 0.")
         
-        # 为每张图片匹配 Domain ID
+        # Assign domain ID per image
         for idx in range(len(self.df)):
-            filename = self.df.iloc[idx, 1]  # filename 列
+            filename = self.df.iloc[idx, 1]  # filename column
             self.domains.append(domain_map.get(filename, 0))
 
     def __len__(self):
         return len(self.df)
 
     def __getitem__(self, idx):
-        img_name = os.path.join(self.img_dir, self.df.iloc[idx, 1])  # filename 列
+        img_name = os.path.join(self.img_dir, self.df.iloc[idx, 1])  # filename column
         image = Image.open(img_name).convert('RGB')
-        label = int(self.df.iloc[idx, 0])  # label 列
+        label = int(self.df.iloc[idx, 0])  # label column
         
-        # [DDK 新增] 获取 Domain ID
         domain_id = self.domains[idx]
         
         if self.transform:
             image = self.transform(image)
         
-        # [DDK 修改] 返回值增加 domain_id
         return image, label, domain_id
 
 
 class Oxford102FlowersDataset(Dataset):
-    def __init__(self, root_dir, split="train", transform=None):
-        """
-        Args:
-            root_dir (str): Oxford 102 Flowers 数据集根目录 (需包含 jpg 文件夹及 .mat 文件)
-            split (str): "train", "val" 或 "test"
-            transform (callable, optional): 图像变换
-        """
+    def __init__(self, root_dir, split="train", transform=None, num_domains=10):
         assert split in ["train", "val", "test"], "split should be 'train', 'val', or 'test'"
         
         self.root_dir = root_dir
@@ -655,45 +626,37 @@ class Oxford102FlowersDataset(Dataset):
         self.labels = []
         self.split = split
         
-        # 1. 加载官方的 .mat 标签文件
-        # imagelabels.mat 包含 1~102 的标签，需减 1 转换为 0-based (0~101)
+        # Load labels from .mat file (1-based -> 0-based)
         labels_mat = scipy.io.loadmat(os.path.join(root_dir, 'imagelabels.mat'))
         all_labels = labels_mat['labels'][0] - 1  
         
-        # 2. 加载数据集划分文件
-        # setid.mat 包含 trnid (train), valid (val), tstid (test)
+        # Load split indices
         setid_mat = scipy.io.loadmat(os.path.join(root_dir, 'setid.mat'))
         if split == 'train':
-            # 细粒度任务中通常将 train 和 val 合并以增加训练数据量
+            # Merge train and val for fine-grained tasks
             split_ids = setid_mat['trnid'][0].tolist() + setid_mat['valid'][0].tolist()
         elif split == 'val':
             split_ids = setid_mat['valid'][0].tolist()
         else: # test
             split_ids = setid_mat['tstid'][0].tolist()
             
-        # =======================================================
-        # [DDK 新增] 3. 预先加载基于类别的 Domain 映射表 (class_id -> domain_id)
-        # =======================================================
-        domain_json_path = os.path.join(root_dir, 'class_to_domain_10.json')
+        # Load class-to-domain mapping
+        domain_json_path = os.path.join(root_dir, f'class_to_domain_{num_domains}.json')
         if os.path.exists(domain_json_path):
             import json
             with open(domain_json_path, 'r') as f:
                 self.class_domain_map = json.load(f)
             if split == "train":
-                print(f"✅ [DDK] 成功加载 Flowers 类别难度分域表: {domain_json_path}")
+                print(f"[DDK] Loaded domain map: {domain_json_path}")
         else:
-            print(f"[Warning] 找不到 {domain_json_path}，所有花卉品种默认分配到 Domain 0")
+            print(f"[Warning] Domain map not found: {domain_json_path}, defaulting to domain 0")
             self.class_domain_map = {}
-            
-        # 4. 构建图像路径和标签列表
         img_dir = os.path.join(root_dir, 'jpg')
         for img_id in split_ids:
-            # 官方图片命名格式为 image_00001.jpg (img_id 是 1-based)
             img_name = f"image_{img_id:05d}.jpg"
             self.image_paths.append(os.path.join(img_dir, img_name))
             
-            # all_labels 的索引是 0-based，所以用 img_id - 1
-            self.labels.append(all_labels[img_id - 1]) 
+            self.labels.append(all_labels[img_id - 1])  # img_id is 1-based
             
         self.transform = transform
 
@@ -705,24 +668,15 @@ class Oxford102FlowersDataset(Dataset):
         image = Image.open(img_path).convert('RGB')
         label = self.labels[idx]
         
-        # =======================================================
-        # [DDK 修改] 直接根据真实的花卉品种标签 (0~101) 获取 domain_id
-        # =======================================================
         domain_id = self.class_domain_map.get(str(label), 0)
         
         if self.transform:
             image = self.transform(image)
             
-        # [DDK 修改] 返回三元组：图像，标签，领域ID
-        return image, label, domain_id       
+        return image, label, domain_id
+
 class StanfordDogsDataset(Dataset):
-    def __init__(self, root_dir, split="train", transform=None):
-        """
-        Args:
-            root_dir (str): Stanford Dogs 数据集根目录
-            split (str): "train" 或 "test".
-            transform (callable, optional): 图像增强.
-        """
+    def __init__(self, root_dir, split="train", transform=None, num_domains=10):
         assert split in ["train", "test"], "split should be either 'train' or 'test'"
 
         self.split_mat = scipy.io.loadmat(os.path.join(root_dir, f"{split}_list.mat"))
@@ -732,19 +686,16 @@ class StanfordDogsDataset(Dataset):
         self.img_dir = os.path.join(root_dir, "Images")
         self.transform = transform
         
-        # =======================================================
-        # [DDK 新增] 预先加载基于类别的 Domain 映射表 (class_id -> domain_id)
-        # =======================================================
-        domain_json_path = os.path.join(root_dir, 'class_to_domain_10.json')
+        # Load class-to-domain mapping
+        domain_json_path = os.path.join(root_dir, f'class_to_domain_{num_domains}.json')
         if os.path.exists(domain_json_path):
             import json
             with open(domain_json_path, 'r') as f:
                 self.class_domain_map = json.load(f)
-            # 仅在训练集打印一次，避免刷屏
             if split == "train":
-                print(f"✅ [DDK] 成功加载 Dog 类别难度分域表: {domain_json_path}")
+                print(f"[DDK] Loaded domain map: {domain_json_path}")
         else:
-            print(f"[Warning] 找不到 {domain_json_path}，所有狗品种默认分配到 Domain 0")
+            print(f"[Warning] Domain map not found: {domain_json_path}, defaulting to domain 0")
             self.class_domain_map = {}
 
     def __len__(self):
@@ -755,9 +706,6 @@ class StanfordDogsDataset(Dataset):
         image = Image.open(img_name).convert('RGB')
         label = self.labels[idx]
         
-        # =======================================================
-        # [DDK 修改] 直接根据真实的狗品种标签 (0~119) 获取 domain_id
-        # =======================================================
         domain_id = self.class_domain_map.get(str(label), 0)
         
         if self.transform:
@@ -768,12 +716,6 @@ class StanfordDogsDataset(Dataset):
 
 class Caltech101Dataset(Dataset):
     def __init__(self, root_dir, split="train", transform=None):
-        """
-        Args:
-            root_dir (str): Caltech 256 데이터셋의 디렉터리 경로.
-            split (str): "train" 또는 "test".
-            transform (callable, optional): 적용할 변환(Optional).
-        """
         assert split in ["train", "test"], "split should be either 'train' or 'test'"
         
         self.root_dir = root_dir
@@ -830,13 +772,7 @@ class Caltech101Dataset(Dataset):
 
 
 class Caltech256Dataset(Dataset):
-    def __init__(self, root_dir, split="train", transform=None):
-        """
-        Args:
-            root_dir (str): Caltech 256 데이터셋의 디렉터리 경로.
-            split (str): "train" 또는 "test".
-            transform (callable, optional): 적용할 변환(Optional).
-        """
+    def __init__(self, root_dir, split="train", transform=None, num_domains=10):
         assert split in ["train", "test"], "split should be either 'train' or 'test'"
         
         self.root_dir = root_dir
@@ -878,18 +814,16 @@ class Caltech256Dataset(Dataset):
         self.image_paths = [self.image_paths[i] for i in split_indices]
         self.labels = [self.labels[i] for i in split_indices]
 
-        # =======================================================
-        # [DDK 新增] 预先加载基于类别的 Domain 映射表 (class_id -> domain_id)
-        # =======================================================
-        domain_json_path = os.path.join(root_dir, 'class_to_domain_10.json')
+        # Load class-to-domain mapping
+        domain_json_path = os.path.join(root_dir, f'class_to_domain_{num_domains}.json')
         if os.path.exists(domain_json_path):
             import json
             with open(domain_json_path, 'r') as f:
                 self.class_domain_map = json.load(f)
             if split == "train":
-                print(f"✅ [DDK] 成功加载 Caltech256 类别难度分域表: {domain_json_path}")
+                print(f"[DDK] Loaded domain map: {domain_json_path}")
         else:
-            print(f"[Warning] 找不到 {domain_json_path}，所有类别默认分配到 Domain 0")
+            print(f"[Warning] Domain map not found: {domain_json_path}, defaulting to domain 0")
             self.class_domain_map = {}
 
     def __len__(self):
@@ -900,13 +834,9 @@ class Caltech256Dataset(Dataset):
         image = Image.open(img_path).convert('RGB')
         label = self.labels[idx]
         
-        # =======================================================
-        # [DDK 新增] 直接根据类别标签获取 domain_id
-        # =======================================================
         domain_id = self.class_domain_map.get(str(label), 0)
         
         if self.transform:
             image = self.transform(image)
         
-        # [DDK 修改] 返回三元组：图像，标签，领域ID
         return image, label, domain_id
